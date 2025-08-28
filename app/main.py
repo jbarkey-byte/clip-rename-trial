@@ -1,5 +1,5 @@
 # app/main.py
-import os, io, re, cv2, json, time, uuid, math, shutil, boto3, zipfile, hashlib, tempfile, mimetypes, subprocess, datetime
+import os, io, re, cv2, json, time, uuid, shutil, boto3, zipfile, hashlib, tempfile, mimetypes, subprocess, datetime
 import numpy as np
 from typing import Dict, List, Tuple, Callable, Optional
 from collections import Counter
@@ -11,13 +11,15 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse, Response, JSONResponse, RedirectResponse
 
-# ---------- ENV / GLOBALS ----------
+# =========================
+# ENV / GLOBALS
+# =========================
 AWS_REGION     = os.environ.get("AWS_REGION", "us-east-2")
 S3_BUCKET      = os.environ.get("S3_BUCKET")
 SECRET_KEY     = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 POSTMARK_TOKEN = os.environ.get("POSTMARK_TOKEN")
 APP_BASE_URL   = os.environ.get("APP_BASE_URL", "https://clip-rename-trial.onrender.com")
-FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # verified in Postmark
+FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # must be verified in Postmark
 
 WHISPER_MODEL   = os.environ.get("WHISPER_MODEL", "tiny")
 WHISPER_MAX_SEC = int(os.environ.get("WHISPER_MAX_SEC", "120"))
@@ -35,6 +37,12 @@ FILENAME_TEMPLATE = os.environ.get("FILENAME_TEMPLATE", "{scene}_{subject}_{acti
 MAX_FILENAME_BYTES = int(os.environ.get("MAX_FILENAME_BYTES", "96"))
 ORIG_TRUNC         = int(os.environ.get("ORIG_TRUNC", "24"))
 
+# Alternates / keywords / sidecar config
+ALT_MIN            = float(os.environ.get("ALT_MIN", "0.60"))
+ALT_MARGIN         = float(os.environ.get("ALT_MARGIN", "0.15"))
+ALT_MAX_KEYWORDS   = int(os.environ.get("ALT_MAX_KEYWORDS", "15"))
+WRITE_XMP_SIDECAR  = os.environ.get("WRITE_XMP_SIDECAR", "1") == "1"  # write <basename>.xmp next to clip
+
 s3 = boto3.client("s3", region_name=AWS_REGION)
 signer = URLSafeTimedSerializer(SECRET_KEY)
 
@@ -51,7 +59,9 @@ app.add_middleware(
 # In-memory job store (OK for the trial)
 JOBS: Dict[str, Dict] = {}
 
-# ---------- small utils ----------
+# =========================
+# Small utils
+# =========================
 def _run(cmd: list, check=True) -> str:
     out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=check)
     return out.stdout.decode("utf-8", "ignore")
@@ -170,7 +180,9 @@ def send_magic_email(to_email: str, link_url: str):
         except Exception: detail = r.text
         raise RuntimeError(f"Postmark {r.status_code}: {detail}")
 
-# ---------- AI helpers (Whisper + spaCy) ----------
+# =========================
+# AI helpers (Whisper + spaCy)
+# =========================
 def _load_nlp():
     global _nlp
     if _nlp is None:
@@ -231,7 +243,9 @@ def _labels_from_transcript(text: str) -> Tuple[str,str,str]:
     def clean(s:str)->str: return re.sub(r"\s+"," ",s or "").strip()
     return (clean(scene), clean(subject), clean(action))
 
-# ---------- Visual cues (CPU, OpenCV) — sequential stride across FULL clip ----------
+# =========================
+# Visual cues (CPU, OpenCV) — sequential stride across FULL clip
+# =========================
 _PEOPLE_HOG = None
 _FACE_CASCADE = None
 
@@ -272,7 +286,7 @@ def _cheap_motion(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     return float(np.mean(cv2.absdiff(prev_gray, gray))) / 255.0
 
 def _bike_wheel_cue(bgr_img: np.ndarray) -> int:
-    # Very lightweight wheel detector: look for 2+ circles in bike-like size
+    # Very lightweight wheel detector: look for 2+ circles in bike-like size and alignment
     h,w = bgr_img.shape[:2]
     min_dim = min(h,w)
     gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
@@ -285,18 +299,29 @@ def _bike_wheel_cue(bgr_img: np.ndarray) -> int:
     except Exception:
         circles = None
     if circles is None: return 0
-    cnt = circles.shape[1] if isinstance(circles, np.ndarray) else 0
-    return int(cnt >= 2)  # count a frame as "has wheels" if >=2 circles
+    cs = np.squeeze(circles, axis=0)
+    # size sanity + pairwise horizontal alignment
+    cs = np.array([c for c in cs if (min_dim*0.05) <= c[2] <= (min_dim*0.30)])
+    if cs.shape[0] < 2: return 0
+    # find any pair with similar radii and y alignment
+    for i in range(len(cs)):
+        for j in range(i+1, len(cs)):
+            r1, r2 = cs[i][2], cs[j][2]
+            y1, y2 = cs[i][1], cs[j][1]
+            if abs(r1-r2) / max(1.0, max(r1,r2)) <= 0.2 and abs(y1-y2) <= (0.10*min_dim):
+                return 1
+    return 0
 
-def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str,str,str,dict]:
+def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str,str,str,dict,dict]:
     """
     Analyze EVERY Nth frame across the whole clip, reading SEQUENTIALLY (no random seeks).
     No time cap by default. Constant memory footprint.
+    Returns (scene, subject, action, debug, votes)
     """
     t0 = time.time()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return ("scene","subject","action", {"frames":0,"note":"open failed","method":"sequential_stride"})
+        return ("scene","subject","action", {"frames":0,"note":"open failed","method":"sequential_stride"}, {})
 
     total_frames_est = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     fps_probe = _parse_fps(ffinfo)
@@ -313,6 +338,26 @@ def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[C
     idx = -1
     reported = 0
 
+    # per-frame votes for candidate tally
+    votes_scene: Counter = Counter()
+    votes_subject: Counter = Counter()
+    votes_action: Counter = Counter()
+
+    def scene_from_colors(avg_g, avg_b, avg_y, avg_gray) -> str:
+        if avg_g > 0.18 and avg_b > 0.10:
+            return "park"
+        if (avg_b > 0.22 and 0.06 <= avg_y <= 0.18 and 0.06 <= avg_g <= 0.20 and avg_gray <= 0.30):
+            return "trail"
+        if avg_b > 0.38 and avg_y > 0.14 and avg_g < 0.06:
+            return "beach"
+        if avg_g > 0.28:
+            return "field"
+        if avg_gray > 0.55:
+            return "indoor"
+        return "outdoor"
+
+    last_keepalive = time.time()
+
     while True:
         if VIS_TIME_BUDGET_SEC > 0 and (time.time()-t0) > VIS_TIME_BUDGET_SEC:
             break
@@ -321,6 +366,10 @@ def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[C
             break
         idx += 1
         if idx % step != 0:
+            # keepalive ping to help proxies not drop SSE (handled in /progress)
+            if progress_cb and (time.time() - last_keepalive) > 15:
+                progress_cb("...")
+                last_keepalive = time.time()
             continue
 
         # resize to VIS_MAX_EDGE
@@ -340,10 +389,35 @@ def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[C
             totals["motion"] += _cheap_motion(prev_gray, gray)
         prev_gray = gray
 
-        totals["bike_wheel_frames"] += _bike_wheel_cue(frame)
+        wheel_hit = _bike_wheel_cue(frame)
+        totals["bike_wheel_frames"] += wheel_hit
 
         analyzed += 1
         totals["frames"] = analyzed
+
+        # per-frame provisional labels for voting
+        s = scene_from_colors(g,b,y,gr)
+        votes_scene[s] += 1
+
+        # subject
+        if wheel_hit:
+            subj = "mountain-biker"
+        elif fa >= 1:
+            subj = "person"
+        else:
+            subj = "scene"
+        votes_subject[subj] += 1
+
+        # action (frame-local; coarse)
+        if wheel_hit:
+            act = "riding"
+        else:
+            # local motion proxy threshold
+            if totals["motion"]/max(1, analyzed) >= 0.08:
+                act = "moving"
+            else:
+                act = "static"
+        votes_action[act] += 1
 
         if VIS_MAX_ANALYSIS_FRAMES > 0 and analyzed >= VIS_MAX_ANALYSIS_FRAMES:
             break
@@ -355,7 +429,7 @@ def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[C
     cap.release()
 
     if analyzed == 0:
-        return ("scene","subject","action", {"frames":0,"note":"no frames decoded","method":"sequential_stride"})
+        return ("scene","subject","action", {"frames":0,"note":"no frames decoded","method":"sequential_stride"}, {})
 
     n = analyzed
     avg_g   = totals["g"]/n
@@ -365,53 +439,143 @@ def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[C
     avg_people = totals["people"]/n
     avg_faces  = totals["faces"]/n
     avg_motion = totals["motion"]/max(1, n-1)
-    wheel_score = float(totals["bike_wheel_frames"]) / n  # 0..1 fraction of frames with 2+ circles
+    wheel_score = float(totals["bike_wheel_frames"]) / n  # 0..1 fraction of frames with wheel pair
 
-    # Scene heuristic (add "trail" to avoid false 'beach' on dirt + sky)
-    if avg_g > 0.18 and avg_b > 0.10:
-        scene = "park"
-    elif (avg_b > 0.22 and 0.05 <= avg_y <= 0.22 and avg_g <= 0.18):
-        scene = "trail"
-    elif avg_b > 0.32 and avg_y > 0.10 and avg_g < 0.10:
-        scene = "beach"
-    elif avg_g > 0.28:
-        scene = "field"
-    elif avg_gray > 0.55:
-        scene = "indoor"
-    else:
-        scene = "outdoor"
+    # final scene using votes
+    scene = votes_scene.most_common(1)[0][0] if votes_scene else "outdoor"
 
-    # Subject with bike cue
-    if wheel_score >= 0.12:
+    # subject using conservative gates
+    # require both wheels (temporal) and motion for mountain-biker
+    bike_conf = min(1.0, wheel_score/0.25) * (1.0 if avg_motion >= 0.06 else 0.5)
+    person_conf = min(1.0, (avg_faces/0.9))  # coarse
+    if bike_conf >= 0.6:
         subject = "mountain-biker"
-    elif avg_faces >= 0.9 or avg_people >= 0.8:
-        subject = "people" if (avg_faces >= 1.8 or avg_people >= 1.6) else "person"
+    elif person_conf >= 0.6:
+        subject = "person"
     else:
         subject = "scene"
 
-    # Motion/action using cheap metric (0..1)
-    if wheel_score >= 0.12 and avg_motion >= 0.05:
+    # action
+    if subject == "mountain-biker" and avg_motion >= 0.05:
         action = "riding"
     else:
         if avg_motion >= 0.14:
-            action = "fast-move" if subject == "scene" else "running"
+            action = "moving" if subject != "scene" else "fast-move"
         elif avg_motion >= 0.08:
-            action = "moving" if subject in {"person","people","mountain-biker"} else "pan-tilt"
+            action = "moving" if subject != "scene" else "pan-tilt"
         elif avg_motion >= 0.04:
-            action = "slow-move" if subject == "scene" else "walking"
+            action = "walking" if subject == "person" else ("slow-move" if subject == "scene" else "moving")
         else:
-            action = "static" if subject == "scene" else "idle"
+            action = "idle" if subject == "person" else ("static" if subject == "scene" else "idle")
 
     debug = dict(
         avg_green=avg_g, avg_blue=avg_b, avg_yellow=avg_y, avg_gray=avg_gray,
         avg_people=avg_people, avg_faces=avg_faces, avg_motion=avg_motion,
         frames_analyzed=n, hog_used=VIS_USE_HOG, time_spent_sec=round(time.time()-t0,2),
         stride=step, estimated_total_frames=total_frames_est, wheel_score=wheel_score,
+        votes_scene=dict(votes_scene), votes_subject=dict(votes_subject), votes_action=dict(votes_action),
         method="sequential_stride"
     )
-    return (scene, subject, action, debug)
 
-# ---------- API ----------
+    # candidate scoring for alternates (simple normalization by votes / heuristics)
+    def normalize(counter: Counter) -> Dict[str,float]:
+        total = sum(counter.values()) or 1
+        return {k: v/total for k,v in counter.items()}
+
+    scores_scene = normalize(votes_scene)
+    # boost/floor for "outdoor" if colors are inconclusive
+    if avg_blue < 0.12 and avg_green < 0.12 and "outdoor" in scores_scene:
+        scores_scene["outdoor"] = max(scores_scene["outdoor"], 0.5)
+
+    scores_subject = {"mountain-biker": bike_conf, "person": person_conf, "scene": 1.0 if (bike_conf<0.4 and person_conf<0.4) else 0.3}
+    # action proxy
+    base_act = Counter(votes_action)
+    scores_action = normalize(base_act)
+    # nudge riding if bike strong + motion present
+    if bike_conf >= 0.6 and avg_motion >= 0.05:
+        scores_action["riding"] = max(scores_action.get("riding",0.0), min(1.0, 0.6 + 0.8*(avg_motion/0.2)))
+
+    votes = {"scene": scores_scene, "subject": scores_subject, "action": scores_action}
+    return (scene, subject, action, debug, votes)
+
+# =========================
+# Alternates / synonyms / XMP sidecar
+# =========================
+_SCENE_SYNONYMS = {
+    "trail": ["singletrack","outdoor","forest"],
+    "outdoor": ["outside","nature"],
+    "park": ["outdoor","green"],
+    "beach": ["coast","shore","sand"],
+    "field": ["meadow","grassland"],
+    "indoor": ["inside","interior"],
+}
+
+_SUBJECT_SYNONYMS = {
+    "mountain-biker": ["cyclist","biker","bike-rider"],
+    "person": ["human","subject"],
+    "people": ["group","crowd"],
+    "scene": [],
+}
+
+_ACTION_SYNONYMS = {
+    "riding": ["cycling","biking"],
+    "moving": ["motion","action"],
+    "running": ["sprinting"],
+    "walking": ["strolling"],
+    "pan-tilt": ["camera-move"],
+    "fast-move": ["quick-move"],
+    "slow-move": ["gentle-move"],
+    "static": ["still"],
+    "idle": ["standing"],
+}
+
+def _select_alternates(score_map: Dict[str,float], primary: str, alt_min=ALT_MIN, alt_margin=ALT_MARGIN, max_keep=3) -> List[str]:
+    if not score_map: return []
+    top = score_map.get(primary, 1.0)
+    # sort by score desc, then name
+    items = sorted(score_map.items(), key=lambda kv: (-kv[1], kv[0]))
+    alts = []
+    for name, sc in items:
+        if name == primary: continue
+        if sc >= alt_min or sc >= (top - alt_margin):
+            alts.append(name)
+        if len(alts) >= max_keep: break
+    return alts
+
+def _xmp_sidecar_bytes(title: str, description: str, flat_keywords: List[str], hier_keywords: List[str]) -> bytes:
+    # Minimal XMP packet for dc:subject + hierarchicalSubject + title/description
+    # Namespaces
+    xmp = f"""<?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+ <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'
+          xmlns:dc='http://purl.org/dc/elements/1.1/'
+          xmlns:xmp='http://ns.adobe.com/xap/1.0/'
+          xmlns:lr='http://ns.adobe.com/lightroom/1.0/'>
+  <rdf:Description>
+   <dc:title><rdf:Alt><rdf:li xml:lang="x-default">{_xml_escape(title)}</rdf:li></rdf:Alt></dc:title>
+   <dc:description><rdf:Alt><rdf:li xml:lang="x-default">{_xml_escape(description)}</rdf:li></rdf:Alt></dc:description>
+   <dc:subject>
+    <rdf:Bag>
+     {''.join(f'<rdf:li>{_xml_escape(k)}</rdf:li>' for k in flat_keywords)}
+    </rdf:Bag>
+   </dc:subject>
+   <lr:hierarchicalSubject>
+    <rdf:Bag>
+     {''.join(f'<rdf:li>{_xml_escape(k)}</rdf:li>' for k in hier_keywords)}
+    </rdf:Bag>
+   </lr:hierarchicalSubject>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"""
+    return xmp.encode("utf-8")
+
+def _xml_escape(s: str) -> str:
+    return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;").replace("'","&apos;")
+
+# =========================
+# API
+# =========================
 @app.get("/health")
 def health(): return {"ok": True}
 
@@ -501,7 +665,7 @@ def _process_real(job_id: str, orig_name: str):
         # VISUAL (sequential stride)
         def cb(msg: str): step(msg)
         step("Analyzing frames…", 44)
-        scene_v, subject_v, action_v, dbg = _visual_labels_stride(local_in, info, progress_cb=cb)
+        scene_v, subject_v, action_v, dbg, votes = _visual_labels_stride(local_in, info, progress_cb=cb)
 
         # Merge: prefer transcript when present; otherwise visual
         scene   = scene_t   or scene_v  or "scene"
@@ -518,9 +682,57 @@ def _process_real(job_id: str, orig_name: str):
         new_name = _compose_filename_from_template(FILENAME_TEMPLATE, tokens, ext)
         new_name = _ensure_unique_path(tmpdir, new_name)
 
+        # ---- Alternates & keywords
+        # select alternates
+        scene_alts   = _select_alternates(votes.get("scene", {}),   scene,   ALT_MIN, ALT_MARGIN, max_keep=3)
+        subject_alts = _select_alternates(votes.get("subject", {}), subject, ALT_MIN, ALT_MARGIN, max_keep=2)
+        action_alts  = _select_alternates(votes.get("action", {}),  action,  ALT_MIN, ALT_MARGIN, max_keep=3)
+
+        # synonyms gated by primary
+        scene_syn = _SCENE_SYNONYMS.get(scene, [])
+        subj_syn  = _SUBJECT_SYNONYMS.get(subject, [])
+        act_syn   = _ACTION_SYNONYMS.get(action, [])
+
+        # build flat keywords (cap length)
+        kw = []
+        def add_kw(lst):
+            for k in lst:
+                if not k: continue
+                if k not in kw:
+                    kw.append(k)
+                    if len(kw) >= ALT_MAX_KEYWORDS: return True
+            return False
+
+        # priority order: primarys → alts → synonyms → utility tags
+        if add_kw([scene, subject, action]): pass
+        if add_kw(scene_alts): pass
+        if add_kw(subject_alts): pass
+        if add_kw(action_alts): pass
+        if add_kw(scene_syn): pass
+        if add_kw(subj_syn): pass
+        if add_kw(act_syn): pass
+        # utility tags for Spotlight/NLE searches
+        add_kw([f"uid-{uid}", f"orig-{_safe_slug(base)[:ORIG_TRUNC]}"])
+
+        # hierarchical keywords
+        hier = []
+        # Scene hierarchy: include alts conservatively
+        hier.append(f"Scene|{scene}")
+        for a in scene_alts[:1]:
+            hier.append(f"Scene|{a}")
+        # Subject hierarchy
+        hier.append(f"Subject|{subject}")
+        for a in subject_alts[:1]:
+            hier.append(f"Subject|{a}")
+        # Action hierarchy
+        hier.append(f"Action|{action}")
+        for a in action_alts[:1]:
+            hier.append(f"Action|{a}")
+
         step("Writing searchable metadata...", 55)
-        title = f"{subject} {action} at {scene}"
-        keywords = [scene, subject, action, f"uid-{uid}", f"orig-{_safe_slug(base)[:ORIG_TRUNC]}"]
+        title = f"{subject} {action} at {scene}".strip()
+        description = title if not transcript else (title + " — " + transcript[:140]).strip()
+        keywords = kw[:ALT_MAX_KEYWORDS]
         _write_metadata(local_in, title=title, keywords=keywords, scene=scene)
 
         step("Building new filename...", 65)
@@ -529,14 +741,33 @@ def _process_real(job_id: str, orig_name: str):
         step("Preparing sidecars...", 75)
         resolve_csv = os.path.join(tmpdir, "Resolve.csv"); _make_resolve_csv(resolve_csv, new_name, scene, "", "", keywords)
 
+        # XMP sidecar (for Spotlight & NLE search)
+        xmp_path = None
+        if WRITE_XMP_SIDECAR:
+            stem, _ = os.path.splitext(new_name)
+            xmp_path = os.path.join(tmpdir, f"{stem}.xmp")
+            xmp_bytes = _xmp_sidecar_bytes(title=title, description=description, flat_keywords=keywords, hier_keywords=hier)
+            with open(xmp_path, "wb") as xf:
+                xf.write(xmp_bytes)
+
         step("Packaging ZIP...", 90)
         zip_path = os.path.join(tmpdir, "result.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(local_out, new_name)
             z.write(resolve_csv, "Resolve.csv")
+            if xmp_path and os.path.exists(xmp_path):
+                # put sidecar next to clip name
+                z.write(xmp_path, os.path.basename(xmp_path))
+            # manifest with alternates
             z.writestr("manifest.json", json.dumps({
                 "original": in_name, "renamed": new_name, "duration_sec": duration,
-                "tokens": tokens, "keywords": keywords,
+                "tokens": tokens,
+                "keywords": keywords,
+                "hier_keywords": hier,
+                "alts": {"scene": scene_alts, "subject": subject_alts, "action": action_alts},
+                "synonyms": {"scene": _SCENE_SYNONYMS.get(scene, []),
+                             "subject": _SUBJECT_SYNONYMS.get(subject, []),
+                             "action": _ACTION_SYNONYMS.get(action, [])},
                 "transcript_excerpt": (transcript[:400] + "…") if transcript else "",
                 "visual_debug": dbg
             }, indent=2))
@@ -564,21 +795,36 @@ async def finalize_upload(payload: Dict, background: BackgroundTasks):
 
 @app.get("/progress/{job_id}")
 def progress(job_id: str):
-    if job_id not in JOBS:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+    # Return SSE even if job is missing so the client doesn't treat 404 as a stream error
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",  # hint for proxies
+        "Connection": "keep-alive",
+    }
 
     def event_stream():
+        # If job missing (e.g., instance restarted), send a terminal event so client can retry
+        if job_id not in JOBS:
+            yield f"event: error\ndata: {json.dumps({'error':'unknown_job'})}\n\n"
+            return
+        last_ping = time.time()
         while True:
             state = JOBS.get(job_id)
             if not state:
+                yield f"event: error\ndata: {json.dumps({'error':'lost_job'})}\n\n"
                 break
             data = {"status": state["status"], "pct": state["pct"], "ready": state["ready"], "filename": state["filename"]}
             yield f"data: {json.dumps(data)}\n\n"
             if state["ready"]:
                 break
+            # heartbeat comment every 15s in case there are no updates
+            now = time.time()
+            if (now - last_ping) > 15:
+                yield ":\n\n"
+                last_ping = now
             time.sleep(1.0)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=headers)
 
 @app.get("/download/{job_id}")
 def download(job_id: str):
