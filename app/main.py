@@ -165,3 +165,112 @@ def _process_real(job_id: str, orig_name: str):
 
 @app.post("/start_job")
 async def start_job(req: Request):
+    # tolerate empty or non-JSON body
+    try:
+        body = await req.json()
+        if not isinstance(body, dict): body = {}
+    except Exception:
+        body = {}
+    # tolerate form
+    if not body:
+        try:
+            form = await req.form()
+            body = dict(form)
+        except Exception:
+            body = {}
+
+    filename = (body.get("filename") or "clip.mp4").strip()
+    content_type = (body.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream")
+
+    job_id = str(uuid.uuid4())
+    object_key = f"uploads/{job_id}/{filename}"
+
+    try:
+        upload_url = s3.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": content_type},
+            ExpiresIn=3600,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Presign error: {e}")
+
+    JOBS[job_id] = {
+        "status": "waiting for upload",
+        "pct": 0,
+        "steps": [],
+        "ready": False,
+        "filename": None,
+        "object_key": object_key,
+        "result_key": f"outputs/{job_id}/result.zip",
+    }
+    return {"job_id": job_id, "upload_url": upload_url, "object_key": object_key}
+
+@app.post("/finalize_upload")
+async def finalize_upload(payload: Dict, background: BackgroundTasks):
+    job_id = payload.get("job_id")
+    orig_name = payload.get("name", "clip.mp4")
+    if not job_id or job_id not in JOBS:
+        raise HTTPException(status_code=400, detail="Unknown job_id")
+
+    # (Optional) ensure object exists
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=JOBS[job_id]["object_key"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Upload not found in bucket")
+
+    JOBS[job_id]["status"] = "Processing…"
+    JOBS[job_id]["pct"] = 1
+    background.add_task(_process_real, job_id, orig_name)
+    return {"ok": True, "job_id": job_id}
+
+@app.get("/progress/{job_id}")
+def progress(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    def event_stream():
+        while True:
+            state = JOBS.get(job_id)
+            if not state:
+                break
+            data = {
+                "status": state["status"],
+                "pct": state["pct"],
+                "ready": state["ready"],
+                "filename": state["filename"],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            if state["ready"]:
+                break
+            time.sleep(1.0)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.get("/download/{job_id}")
+def download(job_id: str):
+    if job_id not in JOBS or not JOBS[job_id]["ready"]:
+        raise HTTPException(status_code=404, detail="Not ready or unknown job")
+
+    result_key = JOBS[job_id].get("result_key")
+    if result_key:
+        try:
+            signed = s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": S3_BUCKET, "Key": result_key},
+                ExpiresIn=600,
+            )
+            return JSONResponse({"redirect": signed})
+        except Exception:
+            pass
+
+    # fallback: generate tiny ZIP in memory (shouldn't happen now)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("README.txt", "Zip not found in S3; fallback path.\n")
+    buf.seek(0)
+    headers = {"Content-Disposition": f'attachment; filename=\"clip-rename-trial-{job_id}.zip\""}
+    return Response(content=buf.read(), media_type="application/zip", headers=headers)
+
+# small util
+import re
+def re_split(pat, s): return [x for x in re.split(pat, s) if x]
