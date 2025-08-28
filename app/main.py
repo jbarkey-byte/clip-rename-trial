@@ -34,12 +34,29 @@ async def start_job(req: Request):
     Client sends: { filename: 'clip.mp4', content_type: 'video/mp4' }
     We return { job_id, upload_url (S3 presigned PUT), object_key }
     """
-    body = await req.json()
+    # Be tolerant: body might be empty or not JSON
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+
+    # Also tolerate form submissions
+    if not body:
+        try:
+            form = await req.form()
+            body = dict(form)
+        except Exception:
+            body = {}
+
     filename = (body.get("filename") or "clip.mp4").strip()
+    import mimetypes
     content_type = (body.get("content_type")
                     or mimetypes.guess_type(filename)[0]
                     or "application/octet-stream")
 
+    import uuid
     job_id = str(uuid.uuid4())
     object_key = f"uploads/{job_id}/{filename}"
 
@@ -47,7 +64,7 @@ async def start_job(req: Request):
         upload_url = s3.generate_presigned_url(
             ClientMethod="put_object",
             Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": content_type},
-            ExpiresIn=3600,  # 1 hour
+            ExpiresIn=3600,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Presign error: {e}")
