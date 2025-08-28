@@ -39,26 +39,24 @@ POSTMARK_TOKEN = os.environ.get("POSTMARK_TOKEN")
 APP_BASE_URL   = os.environ.get("APP_BASE_URL", "https://clip-rename-trial.onrender.com")
 FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # verified in Postmark
 
-WHISPER_MODEL      = os.environ.get("WHISPER_MODEL", "tiny")   # tiny/base for CPU
-WHISPER_MAX_SEC    = int(os.environ.get("WHISPER_MAX_SEC", "120"))
-CPU_THREADS        = int(os.environ.get("CPU_THREADS", "2"))
+WHISPER_MODEL   = os.environ.get("WHISPER_MODEL", "tiny")   # tiny/base for CPU
+WHISPER_MAX_SEC = int(os.environ.get("WHISPER_MAX_SEC", "120"))
+CPU_THREADS     = int(os.environ.get("CPU_THREADS", "2"))
 
-# Visual analysis knobs (safe defaults for small instances)
-VIS_MAX_FRAMES        = int(os.environ.get("VIS_MAX_FRAMES", "12"))     # total frames to analyze
-VIS_TIME_BUDGET_SEC   = int(os.environ.get("VIS_TIME_BUDGET_SEC", "15"))# hard wall-clock cap
-VIS_USE_HOG           = os.environ.get("VIS_USE_HOG", "0") == "1"       # enable people HOG (slower)
-VIS_MAX_EDGE          = int(os.environ.get("VIS_MAX_EDGE", "480"))      # resize so max(h,w)=this
-VIS_THUMBS_FPS        = float(os.environ.get("VIS_THUMBS_FPS", "0.5"))  # ffmpeg fallback fps
-VIS_MIN_FRAMES_OK     = int(os.environ.get("VIS_MIN_FRAMES_OK", "6"))   # if less, try fallback
+# ---- Visual analysis (stride across the WHOLE clip; no time budget by default) ----
+VIS_FRAME_STRIDE        = int(os.environ.get("VIS_FRAME_STRIDE", "8"))   # analyze 1 of every N frames
+VIS_MAX_ANALYSIS_FRAMES = int(os.environ.get("VIS_MAX_ANALYSIS_FRAMES", "0"))  # 0 = unlimited
+VIS_TIME_BUDGET_SEC     = float(os.environ.get("VIS_TIME_BUDGET_SEC", "0"))    # 0 = no time cap
+VIS_USE_HOG             = os.environ.get("VIS_USE_HOG", "1") == "1"      # people detector (slower)
+VIS_MAX_EDGE            = int(os.environ.get("VIS_MAX_EDGE", "480"))     # resize so max(h,w)=this
 
 # Filename templating (underscores between chips, hyphens inside chips)
-# Users can override later; default per product decision:
 FILENAME_TEMPLATE = os.environ.get(
     "FILENAME_TEMPLATE",
     "{scene}_{subject}_{action}_{date}_{orig}"
 )
 MAX_FILENAME_BYTES = int(os.environ.get("MAX_FILENAME_BYTES", "96"))
-ORIG_TRUNC = int(os.environ.get("ORIG_TRUNC", "24"))
+ORIG_TRUNC         = int(os.environ.get("ORIG_TRUNC", "24"))
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 signer = URLSafeTimedSerializer(SECRET_KEY)
@@ -96,6 +94,23 @@ def _ffprobe_json(path: str) -> dict:
     except Exception:
         return {}
 
+def _parse_fps(ffprobe_info: dict) -> float:
+    # Try video stream avg_frame_rate; fallback to r_frame_rate
+    streams = ffprobe_info.get("streams") or []
+    for s in streams:
+        if s.get("codec_type") == "video":
+            rate = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/1"
+            try:
+                num, den = rate.split("/")
+                num = float(num); den = float(den) if float(den) != 0 else 1.0
+                fps = num / den
+                if fps > 1.0:
+                    return fps
+            except Exception:
+                pass
+    # fallback generic
+    return 30.0
+
 def _has_audio_stream(ffprobe_info: dict) -> bool:
     streams = ffprobe_info.get("streams") or []
     for s in streams:
@@ -123,11 +138,10 @@ def _truncate_token(s: str, maxlen: int) -> str:
 def _compose_filename_from_template(template: str, tokens: Dict[str, str], ext: str) -> str:
     """
     Build filename using underscores between chips and hyphens inside chips.
-    Empty chips are skipped. Enforce 96-byte cap by shrinking in priority order.
+    Empty chips are skipped. Enforce byte cap by shrinking in priority order.
     """
-    # Build initial chips
     raw_parts = [p for p in template.split("_") if p]
-    chips: List[Tuple[str,str]] = []  # (name, value)
+    chips: List[Tuple[str,str]] = []
     for part in raw_parts:
         m = re.fullmatch(r"\{([a-z0-9_]+)\}", part.strip())
         if not m:
@@ -136,23 +150,20 @@ def _compose_filename_from_template(template: str, tokens: Dict[str, str], ext: 
         val = (tokens.get(key) or "").strip()
         if not val:
             continue
-        # slugify inside chip (hyphens)
         val_slug = _safe_slug(val)
         if key == "orig":
             val_slug = _truncate_token(val_slug, ORIG_TRUNC)
         chips.append((key, val_slug))
 
     base = "_".join(v for _, v in chips if v)
-    # Apply overall byte cap (reserve dot + ext + possible _NN)
     reserve = 1 + len(ext)
     max_bytes = max(16, MAX_FILENAME_BYTES - reserve)
-    encoded = base.encode("utf-8")
-    if len(encoded) > max_bytes:
-        # shrink in order: scene -> action -> subject -> orig -> others
+
+    if len(base.encode("utf-8")) > max_bytes:
         priority = ["scene", "action", "subject", "orig"]
         name_to_idx = {name: i for i, (name, _) in enumerate(chips)}
-        # initial per-chip limits
         limits = [len(val) for _, val in chips]
+
         def shrink_one(target_key: str, dec: int = 4):
             if target_key not in name_to_idx:
                 return False
@@ -162,20 +173,18 @@ def _compose_filename_from_template(template: str, tokens: Dict[str, str], ext: 
             limits[i] = max(8, limits[i] - dec)
             return True
 
-        # iteratively shrink until within limit or nothing left to shrink
-        safe_guard = 0
-        while len("_".join(_truncate_token(val, limits[i]) for i, (_, val) in enumerate(chips)).encode("utf-8")) > max_bytes and safe_guard < 100:
+        guard = 0
+        while len("_".join(_truncate_token(val, limits[i]) for i, (_, val) in enumerate(chips)).encode("utf-8")) > max_bytes and guard < 100:
             progressed = False
             for key in priority:
                 progressed = shrink_one(key) or progressed
                 if len("_".join(_truncate_token(val, limits[i]) for i, (_, val) in enumerate(chips)).encode("utf-8")) <= max_bytes:
                     break
             if not progressed:
-                # shrink all a bit
                 for i in range(len(limits)):
                     limits[i] = max(6, int(limits[i] * 0.9))
-            safe_guard += 1
-        # rebuild with limits
+            guard += 1
+
         base = "_".join(_truncate_token(val, limits[i]) for i, (_, val) in enumerate(chips))
 
     return base + f".{ext}"
@@ -221,7 +230,7 @@ def send_magic_email(to_email: str, link_url: str):
             "Subject": "Your download is ready",
             "TextBody": f"Your clip is ready. This link is valid for 24 hours:\n\n{link_url}\n",
         },
-        timeout=15,
+        timeout=30,
     )
     if not r.ok:
         try:
@@ -328,7 +337,7 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
 
     return (clean(scene), clean(subject), clean(action))
 
-# ---------- Visual cues (CPU, OpenCV) with time budget & fallbacks ----------
+# ---------- Visual cues (CPU, OpenCV) — stride sampling across the FULL clip ----------
 
 _PEOPLE_HOG = None
 _FACE_CASCADE = None
@@ -349,7 +358,6 @@ def _detect_people_and_faces(bgr_img: np.ndarray) -> Tuple[int, int]:
     faces = _FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48,48))
     people = 0
     if VIS_USE_HOG:
-        # people (HOG) on smaller image for speed
         h, w = bgr_img.shape[:2]
         target_w = 480
         if w > target_w:
@@ -387,120 +395,82 @@ def _motion_magnitude(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1], angleInDegrees=False)
     return float(np.mean(mag))
 
-def _extract_thumbs_ffmpeg(video_path: str, out_dir: str, fps: float, max_frames: int, max_edge: int) -> List[str]:
-    # dump thumbnails with scaling for speed; stop at max_frames
-    pattern = os.path.join(out_dir, "thumb-%03d.jpg")
-    vf = f"fps={fps},scale={max_edge}:-1"
-    cmd = ["ffmpeg","-y","-i",video_path,"-vf",vf,"-frames:v",str(max_frames),pattern]
-    try:
-        _run(cmd)
-    except Exception:
-        return []
-    files = []
-    for i in range(1, max_frames+1):
-        p = os.path.join(out_dir, f"thumb-{i:03d}.jpg")
-        if os.path.exists(p):
-            files.append(p)
-    return files
-
-def _sample_frames_sequential(video_path: str, target_count: int, time_budget: int, max_edge: int, progress_cb: Optional[Callable[[str], None]] = None) -> List[np.ndarray]:
+def _visual_labels_stride(video_path: str, ffinfo: dict, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, str, str, dict]:
+    """
+    Analyze EVERY Nth frame (VIS_FRAME_STRIDE) across the whole clip.
+    No time cap by default (VIS_TIME_BUDGET_SEC = 0). Processes frames streaming (constant memory).
+    """
     t0 = time.time()
-    frames: List[np.ndarray] = []
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return frames
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        return ("scene", "subject", "action", {"frames": 0, "note": "open failed"})
 
-    # stride in frames between samples (avoid random seeking)
-    if total > 0 and target_count > 0:
-        stride = max(1, total // target_count)
+    total_frames_cap = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps_cap = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    fps_probe = _parse_fps(ffinfo)
+    dur = 0.0
+    try:
+        dur = float((ffinfo.get("format") or {}).get("duration") or 0.0)
+    except Exception:
+        pass
+
+    # Estimate total frames if CAP reports 0
+    if total_frames_cap <= 0 and dur > 0 and fps_probe > 1.0:
+        total_frames_est = int(dur * fps_probe)
     else:
-        stride = 30  # ~1/sec for 30fps if unknown
+        total_frames_est = total_frames_cap if total_frames_cap > 0 else int(dur * (fps_cap if fps_cap > 1 else fps_probe))
 
-    grabbed = 0
-    keep_every = stride
-    next_keep = 0
+    step = max(1, int(VIS_FRAME_STRIDE))
+    indices = list(range(0, max(0, total_frames_est), step))
+    if VIS_MAX_ANALYSIS_FRAMES > 0:
+        indices = indices[:VIS_MAX_ANALYSIS_FRAMES]
 
-    while True:
-        ok = cap.grab()
-        if not ok:
-            break
-        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-        grabbed += 1
-        if grabbed >= next_keep:
-            ok2, frame = cap.retrieve()
-            if not ok2:
-                break
-            # resize to max_edge
-            h, w = frame.shape[:2]
-            m = max(h, w)
-            if m > max_edge:
-                scale = max_edge / float(m)
-                frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
-            frames.append(frame)
-            if progress_cb:
-                progress_cb(f"Analyzing frames ({len(frames)}/{target_count})…")
-            next_keep += keep_every
-            if len(frames) >= target_count:
-                break
-        if (time.time() - t0) > time_budget:
-            break
-
-    cap.release()
-    # Fallback: too few frames? try ffmpeg thumbs
-    if len(frames) < VIS_MIN_FRAMES_OK:
-        if (time.time() - t0) < time_budget:
-            tmpdir = tempfile.mkdtemp(prefix="thumbs-")
-            try:
-                thumb_paths = _extract_thumbs_ffmpeg(video_path, tmpdir, VIS_THUMBS_FPS, target_count, max_edge)
-                for i, p in enumerate(thumb_paths):
-                    img = cv2.imread(p)
-                    if img is not None:
-                        frames.append(img)
-                        if progress_cb:
-                            progress_cb(f"Analyzing frames (thumbnails {i+1}/{len(thumb_paths)})…")
-                    if (time.time() - t0) > time_budget or len(frames) >= target_count:
-                        break
-            finally:
-                try: shutil.rmtree(tmpdir)
-                except Exception: pass
-    return frames
-
-def _visual_labels(video_path: str, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, str, str, dict]:
-    """
-    Returns (scene, subject, action, debug_stats) from visuals.
-    Heuristics: color ratios, faces (always), HOG people (optional), motion magnitude.
-    Enforces a wall-clock time budget and sequential decoding.
-    """
-    t0 = time.time()
-    frames = _sample_frames_sequential(
-        video_path,
-        target_count=VIS_MAX_FRAMES,
-        time_budget=VIS_TIME_BUDGET_SEC,
-        max_edge=VIS_MAX_EDGE,
-        progress_cb=progress_cb,
-    )
-    if not frames:
-        return ("scene", "subject", "action", {"frames": 0, "note": "no frames"})
-
-    totals = dict(g=0.0,b=0.0,y=0.0,gray=0.0, people=0, faces=0, motion=0.0, frames=len(frames))
+    totals = dict(g=0.0,b=0.0,y=0.0,gray=0.0, people=0, faces=0, motion=0.0, frames=0)
     prev_gray = None
-    for i, f in enumerate(frames, 1):
-        g, b, y, gr = _color_ratios(f)
-        p, fa = _detect_people_and_faces(f)
+    analyzed = 0
+    total_targets = len(indices)
+
+    for i, idx in enumerate(indices, 1):
+        # Optional wall-clock guard if user sets a budget
+        if VIS_TIME_BUDGET_SEC > 0 and (time.time() - t0) > VIS_TIME_BUDGET_SEC:
+            break
+
+        # Seek and read
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, idx))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            continue
+
+        # resize to VIS_MAX_EDGE
+        h, w = frame.shape[:2]
+        m = max(h, w)
+        if m > VIS_MAX_EDGE:
+            scale = VIS_MAX_EDGE / float(m)
+            frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+
+        # metrics
+        g, b, y, gr = _color_ratios(frame)
+        p, fa = _detect_people_and_faces(frame)
         totals["g"] += g; totals["b"] += b; totals["y"] += y; totals["gray"] += gr
         totals["people"] += p; totals["faces"] += fa
-        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if prev_gray is not None:
             totals["motion"] += _motion_magnitude(prev_gray, gray)
         prev_gray = gray
-        if progress_cb and (i % 2 == 0):
-            progress_cb(f"Analyzing frames ({i}/{len(frames)})…")
-        if (time.time() - t0) > VIS_TIME_BUDGET_SEC:
-            break
 
-    n = max(1, len(frames))
+        analyzed += 1
+        totals["frames"] = analyzed
+
+        if progress_cb and (i % 25 == 0 or i == total_targets):
+            progress_cb(f"Analyzing frames ({i}/{total_targets})…")
+
+    cap.release()
+
+    if analyzed == 0:
+        return ("scene", "subject", "action", {"frames": 0, "note": "no frames decoded"})
+
+    n = analyzed
     avg_g   = totals["g"]/n
     avg_b   = totals["b"]/n
     avg_y   = totals["y"]/n
@@ -509,7 +479,7 @@ def _visual_labels(video_path: str, progress_cb: Optional[Callable[[str], None]]
     avg_faces  = totals["faces"]/n
     avg_motion = totals["motion"]/max(1, n-1)
 
-    # Scene
+    # Scene heuristic
     if avg_g > 0.18 and avg_b > 0.10:
         scene = "park"
     elif avg_b > 0.25 and avg_y > 0.08:
@@ -527,7 +497,7 @@ def _visual_labels(video_path: str, progress_cb: Optional[Callable[[str], None]]
     else:
         subject = "scene"
 
-    # Action from motion + subject
+    # Action
     if avg_motion >= 4.0:
         action = "running" if subject in {"person","people"} else "fast-move"
     elif avg_motion >= 2.2:
@@ -540,7 +510,8 @@ def _visual_labels(video_path: str, progress_cb: Optional[Callable[[str], None]]
     debug = dict(
         avg_green=avg_g, avg_blue=avg_b, avg_yellow=avg_y, avg_gray=avg_gray,
         avg_people=avg_people, avg_faces=avg_faces, avg_motion=avg_motion,
-        frames_analyzed=n, hog_used=VIS_USE_HOG, time_spent_sec=round(time.time()-t0,2)
+        frames_analyzed=n, hog_used=VIS_USE_HOG, time_spent_sec=round(time.time()-t0,2),
+        stride=step, estimated_total_frames=total_frames_est
     )
     return (scene, subject, action, debug)
 
@@ -656,19 +627,19 @@ def _process_real(job_id: str, orig_name: str):
         step("Finding subject, action, scene (speech)…", 36)
         scene_t, subject_t, action_t = _labels_from_transcript(transcript)
 
-        # ---------- VISUAL ----------
+        # ---------- VISUAL (stride across whole clip) ----------
         def cb(msg: str):
-            step(msg)  # live progress messages during visual analysis
+            step(msg)
 
         step("Analyzing frames…", 44)
-        scene_v, subject_v, action_v, dbg = _visual_labels(local_in, progress_cb=cb)
+        scene_v, subject_v, action_v, dbg = _visual_labels_stride(local_in, info, progress_cb=cb)
 
         # Merge: prefer transcript terms when present; otherwise visual
-        scene  = scene_t  or scene_v  or "scene"
-        subject= subject_t or subject_v or "subject"
-        action = action_t or action_v or "action"
+        scene   = scene_t   or scene_v  or "scene"
+        subject = subject_t or subject_v or "subject"
+        action  = action_t  or action_v or "action"
 
-        # ---------- Filename templating (underscores between chips) ----------
+        # ---------- Filename templating ----------
         base, ext = os.path.splitext(in_name)
         ext = ext.lstrip(".").lower() or "mp4"
 
