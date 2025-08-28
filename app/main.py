@@ -272,7 +272,12 @@ def _load_detectors():
 def _detect_people_and_faces(bgr_img: np.ndarray) -> Tuple[int, int]:
     _load_detectors()
     # people (HOG) on smaller image for speed
-    img_small = cv2.resize(bgr_img, (640, int(bgr_img.shape[0] * 640 / max(1, bgr_img.shape[1]))))
+    h, w = bgr_img.shape[:2]
+    target_w = 640
+    if w > target_w:
+        img_small = cv2.resize(bgr_img, (target_w, int(h * target_w / max(1, w))))
+    else:
+        img_small = bgr_img
     rects, _ = _PEOPLE_HOG.detectMultiScale(img_small, winStride=(8,8), padding=(8,8), scale=1.05)
     people = len(rects)
     # faces (cascade)
@@ -294,10 +299,11 @@ def _sample_frames(video_path: str, max_frames: int = 60) -> List[np.ndarray]:
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     dur = frame_count / max(1.0, fps)
-    step = max(1, int(frame_count / max(1, min(max_frames, int(dur)+1)))))
+    # FIXED: balanced step computation without extra parens
+    step = max(1, int(frame_count / max(1, min(max_frames, int(dur) + 1))))
     frames = []
     idx = 0
-    while True:
+    while idx < frame_count:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
         if not ok:
@@ -607,7 +613,7 @@ def download(job_id: str):
         z.writestr("README.txt", "Zip not found in S3; fallback path.\n")
     buf.seek(0)
     headers = {
-        "Content-Disposition": "attachment; filename=clip-rename-trial-{}.zip".format(job_id)
+        "Content-Disposition": f"attachment; filename=clip-rename-trial-{job_id}.zip"
     }
     return Response(content=buf.read(), media_type="application/zip", headers=headers)
 
