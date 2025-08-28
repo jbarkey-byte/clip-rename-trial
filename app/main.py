@@ -2,9 +2,11 @@
 import os
 import io
 import re
+import cv2
 import json
 import time
 import uuid
+import math
 import shutil
 import boto3
 import zipfile
@@ -13,6 +15,7 @@ import tempfile
 import mimetypes
 import subprocess
 import datetime
+import numpy as np
 from typing import Dict, List, Tuple
 from collections import Counter
 
@@ -34,10 +37,10 @@ S3_BUCKET      = os.environ.get("S3_BUCKET")
 SECRET_KEY     = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 POSTMARK_TOKEN = os.environ.get("POSTMARK_TOKEN")
 APP_BASE_URL   = os.environ.get("APP_BASE_URL", "https://clip-rename-trial.onrender.com")
-FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # must be a verified sender in Postmark
+FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # verified in Postmark
 
 WHISPER_MODEL   = os.environ.get("WHISPER_MODEL", "tiny")   # tiny/base for CPU
-WHISPER_MAX_SEC = int(os.environ.get("WHISPER_MAX_SEC", "120"))  # cap transcript
+WHISPER_MAX_SEC = int(os.environ.get("WHISPER_MAX_SEC", "120"))
 CPU_THREADS     = int(os.environ.get("CPU_THREADS", "4"))
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
@@ -51,7 +54,7 @@ app = FastAPI(title="Clip Rename Trial")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten to your Framer domain later
+    allow_origins=["*"],   # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,7 +66,6 @@ JOBS: Dict[str, Dict] = {}
 # ---------- small utils ----------
 
 def _run(cmd: list, check=True) -> str:
-    """Run a subprocess and return stdout text."""
     out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=check)
     return out.stdout.decode("utf-8", "ignore")
 
@@ -88,7 +90,6 @@ def _has_audio_stream(ffprobe_info: dict) -> bool:
     return False
 
 def _sha1_short(path: str, bytes_limit: int = 8_000_000) -> str:
-    """Fast file ID: SHA1 of the first N bytes."""
     h = hashlib.sha1()
     with open(path, "rb") as f:
         h.update(f.read(bytes_limit))
@@ -107,7 +108,7 @@ def _build_filename(scene, subject, action, date_str, shortid, ext) -> str:
     return "--".join([p for p in parts if p]) + f".{ext}"
 
 def _write_metadata(path: str, title: str, keywords: list, scene: str):
-    """No-op for now (ExifTool not installed in this build)."""
+    # No-op for now (ExifTool not in this build)
     return
 
 def _make_resolve_csv(path_csv: str, clip_name: str, scene: str, shot: str, take: str, keywords: list):
@@ -130,7 +131,7 @@ def send_magic_email(to_email: str, link_url: str):
             "Accept": "application/json",
         },
         json={
-            "From": FROM_EMAIL,   # must be verified in Postmark
+            "From": FROM_EMAIL,
             "To": to_email,
             "Subject": "Your download is ready",
             "TextBody": f"Your clip is ready. This link is valid for 24 hours:\n\n{link_url}\n",
@@ -150,7 +151,7 @@ def _load_nlp():
     global _nlp
     if _nlp is None:
         import spacy
-        _nlp = spacy.load("en_core_web_sm", disable=["lemmatizer"])  # fast
+        _nlp = spacy.load("en_core_web_sm", disable=["lemmatizer"])
         _nlp.add_pipe("sentencizer")
     return _nlp
 
@@ -177,7 +178,7 @@ def _extract_audio(src_video: str, out_wav: str, max_seconds: int = 120):
 
 def _transcribe(audio_path: str) -> str:
     model = _load_whisper()
-    segments, info = model.transcribe(
+    segments, _ = model.transcribe(
         audio_path,
         language="en",
         vad_filter=True,
@@ -201,14 +202,9 @@ def _most_common(items: List[str]) -> str:
     return Counter(items).most_common(1)[0][0] if items else ""
 
 def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
-    """
-    Returns (scene, subject, action) from transcript text.
-    - subject: most common PERSON entity; fallback to top Proper Noun/Noun chunk
-    - action: most common verb lemma (non-aux)
-    - scene: 'at/in/on/near ...' phrase; else LOC/GPE entity; else top noun chunk
-    """
+    """(scene, subject, action) from transcript text."""
     if not text or len(text) < 5:
-        return ("scene", "subject", "action")
+        return ("", "", "")
 
     nlp = _load_nlp()
     doc = nlp(text)
@@ -220,10 +216,10 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
         subject = _most_common(proper)
     if not subject:
         noun_chunks = [nc.root.text for nc in doc.noun_chunks]
-        subject = _most_common(noun_chunks) or "subject"
+        subject = _most_common(noun_chunks)
 
     verbs = [t.lemma_ for t in doc if t.pos_ == "VERB" and t.lemma_ not in {"be","do","have"}]
-    action = _most_common(verbs) or "action"
+    action = _most_common(verbs)
 
     scene = ""
     m = re.search(r"\b(at|in|on|near|inside|outside)\s+(the\s+|a\s+|an\s+)?([A-Za-z0-9\- ]{3,40})", text, flags=re.IGNORECASE)
@@ -232,15 +228,153 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
     if not scene:
         locs = [ent.text for ent in doc.ents if ent.label_ in {"GPE","LOC","FAC"}]
         scene = _most_common(locs)
-    if not scene:
-        noun_phrases = [" ".join([t.text for t in nc]) for nc in doc.noun_chunks]
-        scene = _most_common(noun_phrases) or "scene"
 
     def clean(s: str) -> str:
-        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"\s+", " ", s or "")
         return s.strip()
 
     return (clean(scene), clean(subject), clean(action))
+
+# ---------- Visual cues (CPU, OpenCV) ----------
+
+def _color_ratios(bgr_img: np.ndarray) -> Tuple[float, float, float, float]:
+    """Return approx ratios for green, blue, yellow, gray."""
+    hsv = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2HSV)
+    # green
+    mask_g = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
+    # blue (sky/water)
+    mask_b = cv2.inRange(hsv, (90, 40, 40), (130, 255, 255))
+    # yellow/sand
+    mask_y = cv2.inRange(hsv, (20, 40, 40), (35, 255, 255))
+    # low saturation = gray/indoor
+    mask_gray = cv2.inRange(hsv, (0, 0, 40), (179, 40, 220))
+    total = bgr_img.shape[0] * bgr_img.shape[1]
+    eps = 1e-6
+    return (
+        float(mask_g.sum()) / 255.0 / (total + eps),
+        float(mask_b.sum()) / 255.0 / (total + eps),
+        float(mask_y.sum()) / 255.0 / (total + eps),
+        float(mask_gray.sum()) / 255.0 / (total + eps),
+    )
+
+_PEOPLE_HOG = None
+_FACE_CASCADE = None
+
+def _load_detectors():
+    global _PEOPLE_HOG, _FACE_CASCADE
+    if _PEOPLE_HOG is None:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        _PEOPLE_HOG = hog
+    if _FACE_CASCADE is None:
+        _FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+def _detect_people_and_faces(bgr_img: np.ndarray) -> Tuple[int, int]:
+    _load_detectors()
+    # people (HOG) on smaller image for speed
+    img_small = cv2.resize(bgr_img, (640, int(bgr_img.shape[0] * 640 / max(1, bgr_img.shape[1]))))
+    rects, _ = _PEOPLE_HOG.detectMultiScale(img_small, winStride=(8,8), padding=(8,8), scale=1.05)
+    people = len(rects)
+    # faces (cascade)
+    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
+    faces = _FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48,48))
+    return people, len(faces)
+
+def _motion_magnitude(prev_gray: np.ndarray, gray: np.ndarray) -> float:
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
+                                        pyr_scale=0.5, levels=2, winsize=15,
+                                        iterations=2, poly_n=5, poly_sigma=1.2, flags=0)
+    mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1], angleInDegrees=False)
+    return float(np.mean(mag))
+
+def _sample_frames(video_path: str, max_frames: int = 60) -> List[np.ndarray]:
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    dur = frame_count / max(1.0, fps)
+    step = max(1, int(frame_count / max(1, min(max_frames, int(dur)+1)))))
+    frames = []
+    idx = 0
+    while True:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(frame)
+        if len(frames) >= max_frames:
+            break
+        idx += step
+    cap.release()
+    return frames
+
+def _visual_labels(video_path: str) -> Tuple[str, str, str, dict]:
+    """
+    Returns (scene, subject, action, debug_stats) from visuals.
+    Heuristics: color ratios, people/face counts, motion magnitude.
+    """
+    frames = _sample_frames(video_path, max_frames=40)
+    if not frames:
+        return ("scene", "subject", "action", {"frames": 0})
+
+    totals = dict(g=0.0,b=0.0,y=0.0,gray=0.0, people=0, faces=0, motion=0.0, frames=len(frames))
+    prev_gray = None
+    for f in frames:
+        h, w = f.shape[:2]
+        # resize for speed
+        scale = 480.0 / max(h, w)
+        if scale < 1.0:
+            f = cv2.resize(f, (int(w*scale), int(h*scale)))
+        g, b, y, gr = _color_ratios(f)
+        p, fa = _detect_people_and_faces(f)
+        totals["g"] += g; totals["b"] += b; totals["y"] += y; totals["gray"] += gr
+        totals["people"] += p; totals["faces"] += fa
+        gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            totals["motion"] += _motion_magnitude(prev_gray, gray)
+        prev_gray = gray
+
+    n = max(1, len(frames))
+    avg_g   = totals["g"]/n
+    avg_b   = totals["b"]/n
+    avg_y   = totals["y"]/n
+    avg_gray= totals["gray"]/n
+    avg_people = totals["people"]/n
+    avg_faces  = totals["faces"]/n
+    avg_motion = totals["motion"]/max(1, n-1)
+
+    # Scene
+    if avg_g > 0.18 and avg_b > 0.10:
+        scene = "park"
+    elif avg_b > 0.25 and avg_y > 0.08:
+        scene = "beach"
+    elif avg_g > 0.28:
+        scene = "field"
+    elif avg_gray > 0.55:
+        scene = "indoor"
+    else:
+        scene = "outdoor"
+
+    # Subject
+    if avg_faces >= 1.0 or avg_people >= 0.8:
+        subject = "person" if (avg_faces < 1.8 and avg_people < 1.6) else "people"
+    else:
+        subject = "scene"
+
+    # Action from motion + subject
+    if avg_motion >= 4.0:
+        action = "running" if subject in {"person","people"} else "fast-move"
+    elif avg_motion >= 2.2:
+        action = "moving" if subject in {"person","people"} else "pan/tilt"
+    elif avg_motion >= 1.0:
+        action = "walking" if subject in {"person","people"} else "slow-move"
+    else:
+        action = "talking" if avg_faces >= 1.0 else "static"
+
+    debug = dict(avg_green=avg_g, avg_blue=avg_b, avg_yellow=avg_y, avg_gray=avg_gray,
+                 avg_people=avg_people, avg_faces=avg_faces, avg_motion=avg_motion)
+    return (scene, subject, action, debug)
 
 # ---------- API ----------
 
@@ -294,7 +428,7 @@ async def start_job(req: Request):
     return {"job_id": job_id, "upload_url": upload_url, "object_key": object_key}
 
 def _process_real(job_id: str, orig_name: str):
-    """Download from S3, probe, AI labels, rename, make Resolve.csv, zip, upload zip to S3."""
+    """Download from S3, probe, AI (audio+visual), rename, sidecars, zip, upload."""
     state = JOBS[job_id]
 
     def step(msg, pct=None):
@@ -316,7 +450,7 @@ def _process_real(job_id: str, orig_name: str):
         fmt = info.get("format", {}) or {}
         duration = float(fmt.get("duration", 0.0)) if fmt.get("duration") else 0.0
 
-        # Date: prefer container creation_time, else today
+        # Date
         date = None
         tags = (fmt.get("tags") or {})
         ct = tags.get("creation_time")
@@ -332,14 +466,13 @@ def _process_real(job_id: str, orig_name: str):
         step("Creating short clip ID...", 18)
         shortid = _sha1_short(local_in)
 
-        # ---------- AI: transcript → labels ----------
-        audio_wav = os.path.join(tmpdir, "snippet.wav")
-        max_sec = min(WHISPER_MAX_SEC, int(max(15, duration)))
-
+        # ---------- AUDIO ----------
         has_audio = _has_audio_stream(info)
         if has_audio:
             step("Transcribing audio…", 28)
             try:
+                audio_wav = os.path.join(tmpdir, "snippet.wav")
+                max_sec = min(WHISPER_MAX_SEC, int(max(15, duration)))
                 _extract_audio(local_in, audio_wav, max_seconds=max_sec)
                 transcript = _transcribe(audio_wav)
             except Exception:
@@ -348,32 +481,37 @@ def _process_real(job_id: str, orig_name: str):
             step("No audio detected — skipping transcription", 28)
             transcript = ""
 
-        step("Finding subject, action, scene…", 40)
-        scene_ai, subject_ai, action_ai = _labels_from_transcript(transcript)
+        step("Finding subject, action, scene (speech)…", 36)
+        scene_t, subject_t, action_t = _labels_from_transcript(transcript)
 
-        # Fallbacks from original filename tokens
-        base, ext = os.path.splitext(in_name)
-        ext = ext.lstrip(".").lower() or "mp4"
-        tokens = [t for t in re_split(r"[-_ .]+", base) if t]
+        # ---------- VISUAL ----------
+        step("Analyzing frames…", 44)
+        scene_v, subject_v, action_v, dbg = _visual_labels(local_in)
 
-        scene  = scene_ai or (tokens[0] if tokens else "scene")
-        subject= subject_ai or (tokens[1] if len(tokens) > 1 else "subject")
-        action = action_ai or (tokens[2] if len(tokens) > 2 else "action")
+        # Merge: prefer transcript terms when present; otherwise visual
+        scene  = scene_t  or scene_v  or "scene"
+        subject= subject_t or subject_v or "subject"
+        action = action_t or action_v or "action"
 
         step("Writing searchable metadata...", 55)
         title = f"{subject} {action} at {scene}"
         keywords = [scene, subject, action, f"shortid-{shortid}"]
-        _write_metadata(local_in, title=title, keywords=keywords, scene=scene)  # no-op for now
+        _write_metadata(local_in, title=title, keywords=keywords, scene=scene)
 
+        # New name
         step("Building new filename...", 65)
+        base, ext = os.path.splitext(in_name)
+        ext = ext.lstrip(".").lower() or "mp4"
         new_name = _build_filename(scene, subject, action, date_str, shortid, ext)
         local_out = os.path.join(tmpdir, new_name)
         shutil.copy2(local_in, local_out)
 
+        # Sidecars
         step("Preparing sidecars...", 75)
         resolve_csv = os.path.join(tmpdir, "Resolve.csv")
         _make_resolve_csv(resolve_csv, new_name, scene, "", "", keywords)
 
+        # Zip
         step("Packaging ZIP...", 90)
         zip_path = os.path.join(tmpdir, "result.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -384,7 +522,8 @@ def _process_real(job_id: str, orig_name: str):
                 "renamed": new_name,
                 "duration_sec": duration,
                 "keywords": keywords,
-                "transcript_excerpt": (transcript[:400] + "…") if transcript else ""
+                "transcript_excerpt": (transcript[:400] + "…") if transcript else "",
+                "visual_debug": dbg
             }, indent=2))
 
         step("Uploading result...", 96)
