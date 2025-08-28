@@ -99,7 +99,7 @@ def re_split(pat: str, s: str):
 def send_magic_email(to_email: str, link_url: str):
     if not POSTMARK_TOKEN:
         raise RuntimeError("POSTMARK_TOKEN not set")
-    resp = requests.post(
+    r = requests.post(
         "https://api.postmarkapp.com/email",
         headers={
             "X-Postmark-Server-Token": POSTMARK_TOKEN,
@@ -109,11 +109,16 @@ def send_magic_email(to_email: str, link_url: str):
             "From": FROM_EMAIL,   # must be verified in Postmark
             "To": to_email,
             "Subject": "Your download is ready",
-            "TextBody": f"Your clip is ready. This link is valid for 24 hours:\n\n{link_url}\n\n",
+            "TextBody": f"Your clip is ready. This link is valid for 24 hours:\n\n{link_url}\n",
         },
         timeout=15,
     )
-    resp.raise_for_status()
+    if not r.ok:
+        try:
+            detail = r.json().get("Message")
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"Postmark {r.status_code}: {detail}")
 
 # ---------- API ----------
 
