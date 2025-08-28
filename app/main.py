@@ -15,14 +15,28 @@ import subprocess
 import datetime
 from typing import Dict
 
+import requests
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import StreamingResponse, Response, JSONResponse
+from starlette.responses import (
+    StreamingResponse,
+    Response,
+    JSONResponse,
+    RedirectResponse,
+)
 
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-2")
-S3_BUCKET  = os.environ.get("S3_BUCKET")
+# ---------- ENV / GLOBALS ----------
+AWS_REGION     = os.environ.get("AWS_REGION", "us-east-2")
+S3_BUCKET      = os.environ.get("S3_BUCKET")
+SECRET_KEY     = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+POSTMARK_TOKEN = os.environ.get("POSTMARK_TOKEN")
+APP_BASE_URL   = os.environ.get("APP_BASE_URL", "https://clip-rename-trial.onrender.com")
+FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # must be a verified sender in Postmark
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
+signer = URLSafeTimedSerializer(SECRET_KEY)
 
 app = FastAPI(title="Clip Rename Trial")
 
@@ -81,6 +95,25 @@ def _make_resolve_csv(path_csv: str, clip_name: str, scene: str, shot: str, take
 
 def re_split(pat: str, s: str):
     return [x for x in re.split(pat, s) if x]
+
+def send_magic_email(to_email: str, link_url: str):
+    if not POSTMARK_TOKEN:
+        raise RuntimeError("POSTMARK_TOKEN not set")
+    resp = requests.post(
+        "https://api.postmarkapp.com/email",
+        headers={
+            "X-Postmark-Server-Token": POSTMARK_TOKEN,
+            "Accept": "application/json",
+        },
+        json={
+            "From": FROM_EMAIL,   # must be verified in Postmark
+            "To": to_email,
+            "Subject": "Your download is ready",
+            "TextBody": f"Your clip is ready. This link is valid for 24 hours:\n\n{link_url}\n\n",
+        },
+        timeout=15,
+    )
+    resp.raise_for_status()
 
 # ---------- API ----------
 
@@ -293,3 +326,46 @@ def download(job_id: str):
         "Content-Disposition": "attachment; filename=clip-rename-trial-{}.zip".format(job_id)
     }
     return Response(content=buf.read(), media_type="application/zip", headers=headers)
+
+# ---------- email-gated download ----------
+
+@app.post("/email_link")
+async def email_link(payload: Dict):
+    email = (payload.get("email") or "").strip()
+    job_id = (payload.get("job_id") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email required")
+    if job_id not in JOBS or not JOBS[job_id].get("ready"):
+        raise HTTPException(status_code=400, detail="Job not ready")
+
+    token = signer.dumps({"job_id": job_id})
+    link = f"{APP_BASE_URL}/d/{token}"
+
+    try:
+        send_magic_email(email, link)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Email send failed: {e}")
+
+    return {"ok": True}
+
+@app.get("/d/{token}")
+def direct_download(token: str):
+    try:
+        data = signer.loads(token, max_age=86400)  # 24h
+    except SignatureExpired:
+        raise HTTPException(status_code=400, detail="Link expired")
+    except BadSignature:
+        raise HTTPException(status_code=400, detail="Invalid link")
+
+    job_id = data.get("job_id")
+    if not job_id or job_id not in JOBS or not JOBS[job_id].get("ready"):
+        raise HTTPException(status_code=404, detail="Job not found or not ready")
+
+    # Issue a short-lived S3 URL and redirect the browser directly
+    result_key = JOBS[job_id]["result_key"]
+    signed = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_BUCKET, "Key": result_key},
+        ExpiresIn=600,  # 10 minutes
+    )
+    return RedirectResponse(url=signed, status_code=302)
