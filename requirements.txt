@@ -7,3 +7,5 @@ itsdangerous==2.2.0
 requests==2.32.3
 faster-whisper==1.0.3
 spacy==3.7.4
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
