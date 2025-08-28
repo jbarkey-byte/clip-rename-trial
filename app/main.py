@@ -16,7 +16,7 @@ import mimetypes
 import subprocess
 import datetime
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Callable, Optional
 from collections import Counter
 
 import requests
@@ -39,9 +39,17 @@ POSTMARK_TOKEN = os.environ.get("POSTMARK_TOKEN")
 APP_BASE_URL   = os.environ.get("APP_BASE_URL", "https://clip-rename-trial.onrender.com")
 FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # verified in Postmark
 
-WHISPER_MODEL   = os.environ.get("WHISPER_MODEL", "tiny")   # tiny/base for CPU
-WHISPER_MAX_SEC = int(os.environ.get("WHISPER_MAX_SEC", "120"))
-CPU_THREADS     = int(os.environ.get("CPU_THREADS", "4"))
+WHISPER_MODEL      = os.environ.get("WHISPER_MODEL", "tiny")   # tiny/base for CPU
+WHISPER_MAX_SEC    = int(os.environ.get("WHISPER_MAX_SEC", "120"))
+CPU_THREADS        = int(os.environ.get("CPU_THREADS", "2"))
+
+# Visual analysis knobs (safe defaults for small instances)
+VIS_MAX_FRAMES        = int(os.environ.get("VIS_MAX_FRAMES", "12"))     # total frames to analyze
+VIS_TIME_BUDGET_SEC   = int(os.environ.get("VIS_TIME_BUDGET_SEC", "15"))# hard wall-clock cap
+VIS_USE_HOG           = os.environ.get("VIS_USE_HOG", "0") == "1"       # enable people HOG (slower)
+VIS_MAX_EDGE          = int(os.environ.get("VIS_MAX_EDGE", "480"))      # resize so max(h,w)=this
+VIS_THUMBS_FPS        = float(os.environ.get("VIS_THUMBS_FPS", "0.5"))  # ffmpeg fallback fps
+VIS_MIN_FRAMES_OK     = int(os.environ.get("VIS_MIN_FRAMES_OK", "6"))   # if less, try fallback
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 signer = URLSafeTimedSerializer(SECRET_KEY)
@@ -150,8 +158,12 @@ def send_magic_email(to_email: str, link_url: str):
 def _load_nlp():
     global _nlp
     if _nlp is None:
-        import spacy
-        _nlp = spacy.load("en_core_web_sm", disable=["lemmatizer"])
+        try:
+            import spacy
+            _nlp = spacy.load("en_core_web_sm", disable=["lemmatizer"])
+        except Exception:
+            import spacy
+            _nlp = spacy.blank("en")
         _nlp.add_pipe("sentencizer")
     return _nlp
 
@@ -212,13 +224,17 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
     persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
     subject = _most_common(persons)
     if not subject:
-        proper = [t.text for t in doc if t.pos_ == "PROPN" and len(t.text) > 1]
+        proper = [t.text for t in doc if getattr(t, "pos_", "") == "PROPN" and len(t.text) > 1]
         subject = _most_common(proper)
     if not subject:
-        noun_chunks = [nc.root.text for nc in doc.noun_chunks]
+        noun_chunks = []
+        try:
+            noun_chunks = [nc.root.text for nc in doc.noun_chunks]
+        except Exception:
+            pass
         subject = _most_common(noun_chunks)
 
-    verbs = [t.lemma_ for t in doc if t.pos_ == "VERB" and t.lemma_ not in {"be","do","have"}]
+    verbs = [getattr(t, "lemma_", t.text) for t in doc if getattr(t, "pos_", "") == "VERB" and getattr(t, "lemma_", t.text) not in {"be","do","have"}]
     action = _most_common(verbs)
 
     scene = ""
@@ -235,7 +251,37 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
 
     return (clean(scene), clean(subject), clean(action))
 
-# ---------- Visual cues (CPU, OpenCV) ----------
+# ---------- Visual cues (CPU, OpenCV) with time budget & fallbacks ----------
+
+_PEOPLE_HOG = None
+_FACE_CASCADE = None
+
+def _load_detectors():
+    global _PEOPLE_HOG, _FACE_CASCADE
+    if VIS_USE_HOG and _PEOPLE_HOG is None:
+        hog = cv2.HOGDescriptor()
+        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        _PEOPLE_HOG = hog
+    if _FACE_CASCADE is None:
+        _FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+def _detect_people_and_faces(bgr_img: np.ndarray) -> Tuple[int, int]:
+    _load_detectors()
+    # faces (cheap)
+    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
+    faces = _FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48,48))
+    people = 0
+    if VIS_USE_HOG:
+        # people (HOG) on smaller image for speed
+        h, w = bgr_img.shape[:2]
+        target_w = 480
+        if w > target_w:
+            img_small = cv2.resize(bgr_img, (target_w, int(h * target_w / max(1, w))))
+        else:
+            img_small = bgr_img
+        rects, _ = _PEOPLE_HOG.detectMultiScale(img_small, winStride=(8,8), padding=(8,8), scale=1.05)
+        people = len(rects)
+    return people, len(faces)
 
 def _color_ratios(bgr_img: np.ndarray) -> Tuple[float, float, float, float]:
     """Return approx ratios for green, blue, yellow, gray."""
@@ -257,34 +303,6 @@ def _color_ratios(bgr_img: np.ndarray) -> Tuple[float, float, float, float]:
         float(mask_gray.sum()) / 255.0 / (total + eps),
     )
 
-_PEOPLE_HOG = None
-_FACE_CASCADE = None
-
-def _load_detectors():
-    global _PEOPLE_HOG, _FACE_CASCADE
-    if _PEOPLE_HOG is None:
-        hog = cv2.HOGDescriptor()
-        hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-        _PEOPLE_HOG = hog
-    if _FACE_CASCADE is None:
-        _FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-
-def _detect_people_and_faces(bgr_img: np.ndarray) -> Tuple[int, int]:
-    _load_detectors()
-    # people (HOG) on smaller image for speed
-    h, w = bgr_img.shape[:2]
-    target_w = 640
-    if w > target_w:
-        img_small = cv2.resize(bgr_img, (target_w, int(h * target_w / max(1, w))))
-    else:
-        img_small = bgr_img
-    rects, _ = _PEOPLE_HOG.detectMultiScale(img_small, winStride=(8,8), padding=(8,8), scale=1.05)
-    people = len(rects)
-    # faces (cascade)
-    gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
-    faces = _FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48,48))
-    return people, len(faces)
-
 def _motion_magnitude(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
                                         pyr_scale=0.5, levels=2, winsize=15,
@@ -292,46 +310,109 @@ def _motion_magnitude(prev_gray: np.ndarray, gray: np.ndarray) -> float:
     mag, _ = cv2.cartToPolar(flow[...,0], flow[...,1], angleInDegrees=False)
     return float(np.mean(mag))
 
-def _sample_frames(video_path: str, max_frames: int = 60) -> List[np.ndarray]:
+def _extract_thumbs_ffmpeg(video_path: str, out_dir: str, fps: float, max_frames: int, max_edge: int) -> List[str]:
+    # dump thumbnails with scaling for speed; stop at max_frames
+    pattern = os.path.join(out_dir, "thumb-%03d.jpg")
+    vf = f"fps={fps},scale={max_edge}:-1"
+    # -vframes applies after filters; use -frames:v instead for clarity
+    cmd = ["ffmpeg","-y","-i",video_path,"-vf",vf,"-frames:v",str(max_frames),pattern]
+    try:
+        _run(cmd)
+    except Exception:
+        return []
+    files = []
+    for i in range(1, max_frames+1):
+        p = os.path.join(out_dir, f"thumb-{i:03d}.jpg")
+        if os.path.exists(p):
+            files.append(p)
+    return files
+
+def _sample_frames_sequential(video_path: str, target_count: int, time_budget: int, max_edge: int, progress_cb: Optional[Callable[[str], None]] = None) -> List[np.ndarray]:
+    t0 = time.time()
+    frames: List[np.ndarray] = []
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return []
+        return frames
     fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    dur = frame_count / max(1.0, fps)
-    # FIXED: balanced step computation without extra parens
-    step = max(1, int(frame_count / max(1, min(max_frames, int(dur) + 1))))
-    frames = []
-    idx = 0
-    while idx < frame_count:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame = cap.read()
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+    # stride in frames between samples (avoid random seeking)
+    if total > 0 and target_count > 0:
+        stride = max(1, total // target_count)
+    else:
+        stride = 30  # safe default ~1/sec for 30fps if unknown
+
+    grabbed = 0
+    keep_every = stride
+    next_keep = 0
+
+    while True:
+        ok = cap.grab()
         if not ok:
             break
-        frames.append(frame)
-        if len(frames) >= max_frames:
+        pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        grabbed += 1
+        if grabbed >= next_keep:
+            ok2, frame = cap.retrieve()
+            if not ok2:
+                break
+            # resize to max_edge
+            h, w = frame.shape[:2]
+            m = max(h, w)
+            if m > max_edge:
+                scale = max_edge / float(m)
+                frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+            frames.append(frame)
+            if progress_cb:
+                progress_cb(f"Analyzing frames ({len(frames)}/{target_count})…")
+            next_keep += keep_every
+            if len(frames) >= target_count:
+                break
+        if (time.time() - t0) > time_budget:
             break
-        idx += step
+
     cap.release()
+    # Fallback: too few frames? try ffmpeg thumbs
+    if len(frames) < VIS_MIN_FRAMES_OK:
+        # if we still have time, try once
+        if (time.time() - t0) < time_budget:
+            tmpdir = tempfile.mkdtemp(prefix="thumbs-")
+            try:
+                thumb_paths = _extract_thumbs_ffmpeg(video_path, tmpdir, VIS_THUMBS_FPS, target_count, max_edge)
+                for i, p in enumerate(thumb_paths):
+                    img = cv2.imread(p)
+                    if img is not None:
+                        frames.append(img)
+                        if progress_cb:
+                            progress_cb(f"Analyzing frames (thumbnails {i+1}/{len(thumb_paths)})…")
+                    if (time.time() - t0) > time_budget or len(frames) >= target_count:
+                        break
+            finally:
+                try: shutil.rmtree(tmpdir)
+                except Exception: pass
     return frames
 
-def _visual_labels(video_path: str) -> Tuple[str, str, str, dict]:
+def _visual_labels(video_path: str, progress_cb: Optional[Callable[[str], None]] = None) -> Tuple[str, str, str, dict]:
     """
     Returns (scene, subject, action, debug_stats) from visuals.
-    Heuristics: color ratios, people/face counts, motion magnitude.
+    Heuristics: color ratios, faces (always), HOG people (optional), motion magnitude.
+    Enforces a wall-clock time budget and sequential decoding.
     """
-    frames = _sample_frames(video_path, max_frames=40)
+    t0 = time.time()
+    frames = _sample_frames_sequential(
+        video_path,
+        target_count=VIS_MAX_FRAMES,
+        time_budget=VIS_TIME_BUDGET_SEC,
+        max_edge=VIS_MAX_EDGE,
+        progress_cb=progress_cb,
+    )
     if not frames:
-        return ("scene", "subject", "action", {"frames": 0})
+        return ("scene", "subject", "action", {"frames": 0, "note": "no frames"})
 
     totals = dict(g=0.0,b=0.0,y=0.0,gray=0.0, people=0, faces=0, motion=0.0, frames=len(frames))
     prev_gray = None
-    for f in frames:
-        h, w = f.shape[:2]
-        # resize for speed
-        scale = 480.0 / max(h, w)
-        if scale < 1.0:
-            f = cv2.resize(f, (int(w*scale), int(h*scale)))
+    for i, f in enumerate(frames, 1):
         g, b, y, gr = _color_ratios(f)
         p, fa = _detect_people_and_faces(f)
         totals["g"] += g; totals["b"] += b; totals["y"] += y; totals["gray"] += gr
@@ -340,6 +421,10 @@ def _visual_labels(video_path: str) -> Tuple[str, str, str, dict]:
         if prev_gray is not None:
             totals["motion"] += _motion_magnitude(prev_gray, gray)
         prev_gray = gray
+        if progress_cb and (i % 2 == 0):
+            progress_cb(f"Analyzing frames ({i}/{len(frames)})…")
+        if (time.time() - t0) > VIS_TIME_BUDGET_SEC:
+            break
 
     n = max(1, len(frames))
     avg_g   = totals["g"]/n
@@ -378,8 +463,11 @@ def _visual_labels(video_path: str) -> Tuple[str, str, str, dict]:
     else:
         action = "talking" if avg_faces >= 1.0 else "static"
 
-    debug = dict(avg_green=avg_g, avg_blue=avg_b, avg_yellow=avg_y, avg_gray=avg_gray,
-                 avg_people=avg_people, avg_faces=avg_faces, avg_motion=avg_motion)
+    debug = dict(
+        avg_green=avg_g, avg_blue=avg_b, avg_yellow=avg_y, avg_gray=avg_gray,
+        avg_people=avg_people, avg_faces=avg_faces, avg_motion=avg_motion,
+        frames_analyzed=n, hog_used=VIS_USE_HOG, time_spent_sec=round(time.time()-t0,2)
+    )
     return (scene, subject, action, debug)
 
 # ---------- API ----------
@@ -491,8 +579,11 @@ def _process_real(job_id: str, orig_name: str):
         scene_t, subject_t, action_t = _labels_from_transcript(transcript)
 
         # ---------- VISUAL ----------
+        def cb(msg: str):
+            step(msg)  # live progress messages during visual analysis
+
         step("Analyzing frames…", 44)
-        scene_v, subject_v, action_v, dbg = _visual_labels(local_in)
+        scene_v, subject_v, action_v, dbg = _visual_labels(local_in, progress_cb=cb)
 
         # Merge: prefer transcript terms when present; otherwise visual
         scene  = scene_t  or scene_v  or "scene"
