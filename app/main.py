@@ -51,6 +51,15 @@ VIS_MAX_EDGE          = int(os.environ.get("VIS_MAX_EDGE", "480"))      # resize
 VIS_THUMBS_FPS        = float(os.environ.get("VIS_THUMBS_FPS", "0.5"))  # ffmpeg fallback fps
 VIS_MIN_FRAMES_OK     = int(os.environ.get("VIS_MIN_FRAMES_OK", "6"))   # if less, try fallback
 
+# Filename templating (underscores between chips, hyphens inside chips)
+# Users can override later; default per product decision:
+FILENAME_TEMPLATE = os.environ.get(
+    "FILENAME_TEMPLATE",
+    "{scene}_{subject}_{action}_{date}_{orig}"
+)
+MAX_FILENAME_BYTES = int(os.environ.get("MAX_FILENAME_BYTES", "96"))
+ORIG_TRUNC = int(os.environ.get("ORIG_TRUNC", "24"))
+
 s3 = boto3.client("s3", region_name=AWS_REGION)
 signer = URLSafeTimedSerializer(SECRET_KEY)
 
@@ -104,19 +113,87 @@ def _sha1_short(path: str, bytes_limit: int = 8_000_000) -> str:
     return h.hexdigest()[:8]
 
 def _safe_slug(s: str) -> str:
-    return "".join(ch.lower() if ch.isalnum() else "-" for ch in s).strip("-").replace("--", "-")
+    """Lower, keep alnum, hyphen as word separator (inside chips)."""
+    return "".join(ch.lower() if ch.isalnum() else "-" for ch in (s or "")).strip("-").replace("--", "-")
 
-def _truncate_token(s: str, maxlen: int = 28) -> str:
+def _truncate_token(s: str, maxlen: int) -> str:
     s = s[:maxlen]
     return re.sub(r"-{2,}", "-", s).strip("-")
 
-def _build_filename(scene, subject, action, date_str, shortid, ext) -> str:
-    parts = [scene, subject, action, date_str, f"shortid-{shortid}"]
-    parts = [_truncate_token(_safe_slug(p)) for p in parts if p]
-    return "--".join([p for p in parts if p]) + f".{ext}"
+def _compose_filename_from_template(template: str, tokens: Dict[str, str], ext: str) -> str:
+    """
+    Build filename using underscores between chips and hyphens inside chips.
+    Empty chips are skipped. Enforce 96-byte cap by shrinking in priority order.
+    """
+    # Build initial chips
+    raw_parts = [p for p in template.split("_") if p]
+    chips: List[Tuple[str,str]] = []  # (name, value)
+    for part in raw_parts:
+        m = re.fullmatch(r"\{([a-z0-9_]+)\}", part.strip())
+        if not m:
+            continue
+        key = m.group(1)
+        val = (tokens.get(key) or "").strip()
+        if not val:
+            continue
+        # slugify inside chip (hyphens)
+        val_slug = _safe_slug(val)
+        if key == "orig":
+            val_slug = _truncate_token(val_slug, ORIG_TRUNC)
+        chips.append((key, val_slug))
+
+    base = "_".join(v for _, v in chips if v)
+    # Apply overall byte cap (reserve dot + ext + possible _NN)
+    reserve = 1 + len(ext)
+    max_bytes = max(16, MAX_FILENAME_BYTES - reserve)
+    encoded = base.encode("utf-8")
+    if len(encoded) > max_bytes:
+        # shrink in order: scene -> action -> subject -> orig -> others
+        priority = ["scene", "action", "subject", "orig"]
+        name_to_idx = {name: i for i, (name, _) in enumerate(chips)}
+        # initial per-chip limits
+        limits = [len(val) for _, val in chips]
+        def shrink_one(target_key: str, dec: int = 4):
+            if target_key not in name_to_idx:
+                return False
+            i = name_to_idx[target_key]
+            if limits[i] <= 8:
+                return False
+            limits[i] = max(8, limits[i] - dec)
+            return True
+
+        # iteratively shrink until within limit or nothing left to shrink
+        safe_guard = 0
+        while len("_".join(_truncate_token(val, limits[i]) for i, (_, val) in enumerate(chips)).encode("utf-8")) > max_bytes and safe_guard < 100:
+            progressed = False
+            for key in priority:
+                progressed = shrink_one(key) or progressed
+                if len("_".join(_truncate_token(val, limits[i]) for i, (_, val) in enumerate(chips)).encode("utf-8")) <= max_bytes:
+                    break
+            if not progressed:
+                # shrink all a bit
+                for i in range(len(limits)):
+                    limits[i] = max(6, int(limits[i] * 0.9))
+            safe_guard += 1
+        # rebuild with limits
+        base = "_".join(_truncate_token(val, limits[i]) for i, (_, val) in enumerate(chips))
+
+    return base + f".{ext}"
+
+def _ensure_unique_path(dirpath: str, filename: str) -> str:
+    """Append _02, _03, ... if needed to avoid collision in dirpath."""
+    stem, ext = os.path.splitext(filename)
+    cand = filename
+    n = 2
+    while os.path.exists(os.path.join(dirpath, cand)):
+        cand = f"{stem}_{n:02d}{ext}"
+        n += 1
+        if n > 99:
+            break
+    return cand
 
 def _write_metadata(path: str, title: str, keywords: list, scene: str):
-    # No-op for now (ExifTool not in this build)
+    # No-op in this build (ExifTool not installed here).
     return
 
 def _make_resolve_csv(path_csv: str, clip_name: str, scene: str, shot: str, take: str, keywords: list):
@@ -314,7 +391,6 @@ def _extract_thumbs_ffmpeg(video_path: str, out_dir: str, fps: float, max_frames
     # dump thumbnails with scaling for speed; stop at max_frames
     pattern = os.path.join(out_dir, "thumb-%03d.jpg")
     vf = f"fps={fps},scale={max_edge}:-1"
-    # -vframes applies after filters; use -frames:v instead for clarity
     cmd = ["ffmpeg","-y","-i",video_path,"-vf",vf,"-frames:v",str(max_frames),pattern]
     try:
         _run(cmd)
@@ -334,14 +410,13 @@ def _sample_frames_sequential(video_path: str, target_count: int, time_budget: i
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return frames
-    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     # stride in frames between samples (avoid random seeking)
     if total > 0 and target_count > 0:
         stride = max(1, total // target_count)
     else:
-        stride = 30  # safe default ~1/sec for 30fps if unknown
+        stride = 30  # ~1/sec for 30fps if unknown
 
     grabbed = 0
     keep_every = stride
@@ -375,7 +450,6 @@ def _sample_frames_sequential(video_path: str, target_count: int, time_budget: i
     cap.release()
     # Fallback: too few frames? try ffmpeg thumbs
     if len(frames) < VIS_MIN_FRAMES_OK:
-        # if we still have time, try once
         if (time.time() - t0) < time_budget:
             tmpdir = tempfile.mkdtemp(prefix="thumbs-")
             try:
@@ -457,7 +531,7 @@ def _visual_labels(video_path: str, progress_cb: Optional[Callable[[str], None]]
     if avg_motion >= 4.0:
         action = "running" if subject in {"person","people"} else "fast-move"
     elif avg_motion >= 2.2:
-        action = "moving" if subject in {"person","people"} else "pan/tilt"
+        action = "moving" if subject in {"person","people"} else "pan-tilt"
     elif avg_motion >= 1.0:
         action = "walking" if subject in {"person","people"} else "slow-move"
     else:
@@ -544,21 +618,25 @@ def _process_real(job_id: str, orig_name: str):
         fmt = info.get("format", {}) or {}
         duration = float(fmt.get("duration", 0.0)) if fmt.get("duration") else 0.0
 
-        # Date
+        # Date & Time
         date = None
+        shoot_dt = None
         tags = (fmt.get("tags") or {})
         ct = tags.get("creation_time")
         if ct:
             try:
-                date = datetime.datetime.fromisoformat(ct.replace("Z", "+00:00")).date()
+                shoot_dt = datetime.datetime.fromisoformat(ct.replace("Z", "+00:00"))
+                date = shoot_dt.date()
             except Exception:
                 pass
         if not date:
-            date = datetime.date.today()
+            shoot_dt = datetime.datetime.utcnow()
+            date = shoot_dt.date()
         date_str = date.isoformat()
+        time_str = shoot_dt.strftime("%H%M%S")
 
-        step("Creating short clip ID...", 18)
-        shortid = _sha1_short(local_in)
+        step("Creating clip UID…", 18)
+        uid = _sha1_short(local_in)  # hidden, not used in filename
 
         # ---------- AUDIO ----------
         has_audio = _has_audio_stream(info)
@@ -590,16 +668,36 @@ def _process_real(job_id: str, orig_name: str):
         subject= subject_t or subject_v or "subject"
         action = action_t or action_v or "action"
 
-        step("Writing searchable metadata...", 55)
-        title = f"{subject} {action} at {scene}"
-        keywords = [scene, subject, action, f"shortid-{shortid}"]
-        _write_metadata(local_in, title=title, keywords=keywords, scene=scene)
-
-        # New name
-        step("Building new filename...", 65)
+        # ---------- Filename templating (underscores between chips) ----------
         base, ext = os.path.splitext(in_name)
         ext = ext.lstrip(".").lower() or "mp4"
-        new_name = _build_filename(scene, subject, action, date_str, shortid, ext)
+
+        tokens = {
+            "scene": scene,
+            "subject": subject,
+            "action": action,
+            "date": date_str,
+            "time": time_str,
+            "orig": base,              # original filename stem (user-friendly)
+            "camera": "",              # reserved
+            "card": "",                # reserved
+            "seq": "",                 # reserved
+            "uid": uid,                # hidden
+        }
+        new_name = _compose_filename_from_template(FILENAME_TEMPLATE, tokens, ext)
+        new_name = _ensure_unique_path(tmpdir, new_name)
+
+        step("Writing searchable metadata...", 55)
+        title = f"{subject} {action} at {scene}"
+        keywords = [
+            scene, subject, action,
+            f"uid-{uid}",                 # hidden but Spotlight-searchable
+            f"orig-{_safe_slug(base)[:ORIG_TRUNC]}"
+        ]
+        _write_metadata(local_in, title=title, keywords=keywords, scene=scene)
+
+        # Copy to final name
+        step("Building new filename...", 65)
         local_out = os.path.join(tmpdir, new_name)
         shutil.copy2(local_in, local_out)
 
@@ -608,7 +706,7 @@ def _process_real(job_id: str, orig_name: str):
         resolve_csv = os.path.join(tmpdir, "Resolve.csv")
         _make_resolve_csv(resolve_csv, new_name, scene, "", "", keywords)
 
-        # Zip
+        # Manifest + ZIP
         step("Packaging ZIP...", 90)
         zip_path = os.path.join(tmpdir, "result.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -618,6 +716,7 @@ def _process_real(job_id: str, orig_name: str):
                 "original": in_name,
                 "renamed": new_name,
                 "duration_sec": duration,
+                "tokens": tokens,
                 "keywords": keywords,
                 "transcript_excerpt": (transcript[:400] + "…") if transcript else "",
                 "visual_debug": dbg
