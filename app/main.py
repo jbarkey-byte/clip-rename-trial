@@ -222,4 +222,292 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
 
     # SCENE (prepositional phrase → places)
     scene = ""
-    # simple regex for " at/in/o
+    # simple regex for " at/in/on/near ... "
+    m = re.search(r"\b(at|in|on|near|inside|outside)\s+(the\s+|a\s+|an\s+)?([A-Za-z0-9\- ]{3,40})", text, flags=re.IGNORECASE)
+    if m:
+        scene = m.group(3).strip()
+    if not scene:
+        # Location entities first
+        locs = [ent.text for ent in doc.ents if ent.label_ in {"GPE","LOC","FAC"}]
+        scene = _most_common(locs)
+    if not scene:
+        # fallback: frequent noun chunk
+        noun_phrases = [" ".join([t.text for t in nc]) for nc in doc.noun_chunks]
+        scene = _most_common(noun_phrases) or "scene"
+
+    # clean up
+    def clean(s: str) -> str:
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    return (clean(scene), clean(subject), clean(action))
+
+# ---------- API ----------
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/start_job")
+async def start_job(req: Request):
+    """
+    Client sends: { filename: 'clip.mp4', content_type: 'video/mp4' } (optional)
+    Returns: { job_id, upload_url (S3 presigned PUT), object_key }
+    """
+    # Be tolerant of empty/non-JSON bodies
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    if not body:
+        try:
+            form = await req.form()
+            body = dict(form)
+        except Exception:
+            body = {}
+
+    filename = (body.get("filename") or "clip.mp4").strip()
+    content_type = (body.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream")
+
+    job_id = str(uuid.uuid4())
+    object_key = f"uploads/{job_id}/{filename}"
+
+    try:
+        upload_url = s3.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": content_type},
+            ExpiresIn=3600,  # 1 hour
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Presign error: {e}")
+
+    JOBS[job_id] = {
+        "status": "waiting for upload",
+        "pct": 0,
+        "steps": [],
+        "ready": False,
+        "filename": None,
+        "object_key": object_key,
+        "result_key": f"outputs/{job_id}/result.zip",
+    }
+    return {"job_id": job_id, "upload_url": upload_url, "object_key": object_key}
+
+def _process_real(job_id: str, orig_name: str):
+    """Download from S3, probe, AI labels, rename, make Resolve.csv, zip, upload zip to S3."""
+    state = JOBS[job_id]
+
+    def step(msg, pct=None):
+        state["status"] = msg
+        if pct is not None:
+            state["pct"] = pct
+        state["steps"].append(msg)
+
+    step("Downloading clip...", 5)
+    tmpdir = tempfile.mkdtemp(prefix="cliptrial-")
+    try:
+        input_key = state["object_key"]
+        in_name = os.path.basename(input_key)
+        local_in = os.path.join(tmpdir, in_name)
+        s3.download_file(S3_BUCKET, input_key, local_in)
+
+        step("Reading media info...", 12)
+        info = _ffprobe_json(local_in)
+        fmt = info.get("format", {}) or {}
+        duration = float(fmt.get("duration", 0.0)) if fmt.get("duration") else 0.0
+
+        # Date: prefer container creation_time, else today
+        date = None
+        tags = (fmt.get("tags") or {})
+        ct = tags.get("creation_time")
+        if ct:
+            try:
+                date = datetime.datetime.fromisoformat(ct.replace("Z", "+00:00")).date()
+            except Exception:
+                pass
+        if not date:
+            date = datetime.date.today()
+        date_str = date.isoformat()
+
+        step("Creating short clip ID...", 18)
+        shortid = _sha1_short(local_in)
+
+        # ---------- AI: transcript → labels ----------
+        audio_wav = os.path.join(tmpdir, "snippet.wav")
+        max_sec = min(WHISPER_MAX_SEC, int(max(15, duration)))  # transcribe up to 2 min or clip length
+        step("Transcribing audio…", 28)
+        try:
+            _extract_audio(local_in, audio_wav, max_seconds=max_sec)
+            transcript = _transcribe(audio_wav)
+        except Exception:
+            transcript = ""
+
+        step("Finding subject, action, scene…", 40)
+        scene_ai, subject_ai, action_ai = _labels_from_transcript(transcript)
+
+        # VERY small guardrails: if transcript was empty, fall back to filename tokens
+        base, ext = os.path.splitext(in_name)
+        ext = ext.lstrip(".").lower() or "mp4"
+        tokens = [t for t in re_split(r"[-_ .]+", base) if t]
+
+        scene  = scene_ai or (tokens[0] if tokens else "scene")
+        subject= subject_ai or (tokens[1] if len(tokens) > 1 else "subject")
+        action = action_ai or (tokens[2] if len(tokens) > 2 else "action")
+
+        step("Writing searchable metadata...", 55)
+        title = f"{subject} {action} at {scene}"
+        keywords = [scene, subject, action, f"shortid-{shortid}"]
+        _write_metadata(local_in, title=title, keywords=keywords, scene=scene)  # no-op for now
+
+        step("Building new filename...", 65)
+        new_name = _build_filename(scene, subject, action, date_str, shortid, ext)
+        local_out = os.path.join(tmpdir, new_name)
+        shutil.copy2(local_in, local_out)
+
+        step("Preparing sidecars...", 75)
+        resolve_csv = os.path.join(tmpdir, "Resolve.csv")
+        _make_resolve_csv(resolve_csv, new_name, scene, "", "", keywords)
+
+        step("Packaging ZIP...", 90)
+        zip_path = os.path.join(tmpdir, "result.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(local_out, new_name)
+            z.write(resolve_csv, "Resolve.csv")
+            z.writestr("manifest.json", json.dumps({
+                "original": in_name,
+                "renamed": new_name,
+                "duration_sec": duration,
+                "keywords": keywords,
+                "transcript_excerpt": (transcript[:400] + "…") if transcript else ""
+            }, indent=2))
+
+        step("Uploading result...", 96)
+        with open(zip_path, "rb") as f:
+            s3.put_object(
+                Bucket=S3_BUCKET,
+                Key=state["result_key"],
+                Body=f.read(),
+                ContentType="application/zip",
+            )
+
+        state["filename"] = new_name
+        state["status"] = "Done"
+        state["pct"] = 100
+        state["ready"] = True
+    finally:
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+
+@app.post("/finalize_upload")
+async def finalize_upload(payload: Dict, background: BackgroundTasks):
+    job_id = payload.get("job_id")
+    orig_name = payload.get("name", "clip.mp4")
+    if not job_id or job_id not in JOBS:
+        raise HTTPException(status_code=400, detail="Unknown job_id")
+
+    # Ensure the upload exists before processing
+    try:
+        s3.head_object(Bucket=S3_BUCKET, Key=JOBS[job_id]["object_key"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Upload not found in bucket")
+
+    JOBS[job_id]["status"] = "Processing..."
+    JOBS[job_id]["pct"] = 1
+    background.add_task(_process_real, job_id, orig_name)
+    return {"ok": True, "job_id": job_id}
+
+@app.get("/progress/{job_id}")
+def progress(job_id: str):
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    def event_stream():
+        while True:
+            state = JOBS.get(job_id)
+            if not state:
+                break
+            data = {
+                "status": state["status"],
+                "pct": state["pct"],
+                "ready": state["ready"],
+                "filename": state["filename"],
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+            if state["ready"]:
+                break
+            time.sleep(1.0)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.get("/download/{job_id}")
+def download(job_id: str):
+    if job_id not in JOBS or not JOBS[job_id]["ready"]:
+        raise HTTPException(status_code=404, detail="Not ready or unknown job")
+
+    result_key = JOBS[job_id].get("result_key")
+    if result_key:
+        try:
+            signed = s3.generate_presigned_url(
+                ClientMethod="get_object",
+                Params={"Bucket": S3_BUCKET, "Key": result_key},
+                ExpiresIn=600,
+            )
+            return JSONResponse({"redirect": signed})
+        except Exception:
+            pass
+
+    # Fallback: in-memory ZIP (shouldn't be needed)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("README.txt", "Zip not found in S3; fallback path.\n")
+    buf.seek(0)
+    headers = {
+        "Content-Disposition": "attachment; filename=clip-rename-trial-{}.zip".format(job_id)
+    }
+    return Response(content=buf.read(), media_type="application/zip", headers=headers)
+
+# ---------- email-gated download ----------
+
+@app.post("/email_link")
+async def email_link(payload: Dict):
+    email = (payload.get("email") or "").strip()
+    job_id = (payload.get("job_id") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Valid email required")
+    if job_id not in JOBS or not JOBS[job_id].get("ready"):
+        raise HTTPException(status_code=400, detail="Job not ready")
+
+    token = signer.dumps({"job_id": job_id})
+    link = f"{APP_BASE_URL}/d/{token}"
+
+    try:
+        send_magic_email(email, link)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Email send failed: {e}")
+
+    return {"ok": True}
+
+@app.get("/d/{token}")
+def direct_download(token: str):
+    try:
+        data = signer.loads(token, max_age=86400)  # 24h
+    except SignatureExpired:
+        raise HTTPException(status_code=400, detail="Link expired")
+    except BadSignature:
+        raise HTTPException(status_code=400, detail="Invalid link")
+
+    job_id = data.get("job_id")
+    if not job_id or job_id not in JOBS or not JOBS[job_id].get("ready"):
+        raise HTTPException(status_code=404, detail="Job not found or not ready")
+
+    # Issue a short-lived S3 URL and redirect the browser directly
+    result_key = JOBS[job_id]["result_key"]
+    signed = s3.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": S3_BUCKET, "Key": result_key},
+        ExpiresIn=600,  # 10 minutes
+    )
+    return RedirectResponse(url=signed, status_code=302)
