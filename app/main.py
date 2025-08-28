@@ -4,6 +4,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse, Response, JSONResponse
 import boto3
+import re
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-2")
 S3_BUCKET  = os.environ.get("S3_BUCKET")
