@@ -55,18 +55,8 @@ def _build_filename(scene, subject, action, date_str, shortid, ext):
     return "--".join([_safe_slug(p) for p in parts if p]).strip("-") + f".{ext}"
 
 def _write_metadata(path: str, title: str, keywords: list, scene: str):
-    kw = ",".join(keywords)
-    # Write XMP + QuickTime atoms with ExifTool (Spotlight & NLE friendly)
-    cmd = [
-        "exiftool", "-overwrite_original",
-        f"-XMP-dc:Title={title}",
-        f"-XMP-dc:Subject={kw}",
-        f"-XMP-xmpDM:scene={scene}",
-        f"-QuickTime:Title={title}",
-        f"-QuickTime:com.apple.quicktime.keyword={kw}",
-        path
-    ]
-    _run(cmd)
+    # ExifTool not installed in this build; skip embedding for now.
+    return
 
 def _make_resolve_csv(path_csv: str, clip_name: str, scene: str, shot: str, take: str, keywords: list):
     # Minimal Resolve CSV
