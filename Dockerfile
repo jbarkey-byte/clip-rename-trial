@@ -4,9 +4,9 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# add ffmpeg + exiftool for real processing
+# Install ffmpeg + exiftool (Debian package name is libimage-exiftool-perl)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg exiftool \
+    ffmpeg libimage-exiftool-perl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
