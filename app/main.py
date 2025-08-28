@@ -452,7 +452,7 @@ async def start_job(req: Request):
 def _process_real(job_id: str, orig_name: str):
     state = JOBS[job_id]
     def step(msg, pct=None):
-        state["status"] = msg; 
+        state["status"] = msg
         if pct is not None: state["pct"] = pct
         state["steps"].append(msg)
 
@@ -564,14 +564,20 @@ async def finalize_upload(payload: Dict, background: BackgroundTasks):
 
 @app.get("/progress/{job_id}")
 def progress(job_id: str):
-    if job_id not in JOBS: raise HTTPException(status_code=404, detail="Unknown job_id")
+    if job_id not in JOBS:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
     def event_stream():
         while True:
-            state = JOBS.get(job_id); if not state: break
+            state = JOBS.get(job_id)
+            if not state:
+                break
             data = {"status": state["status"], "pct": state["pct"], "ready": state["ready"], "filename": state["filename"]}
             yield f"data: {json.dumps(data)}\n\n"
-            if state["ready"]: break
+            if state["ready"]:
+                break
             time.sleep(1.0)
+
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 @app.get("/download/{job_id}")
