@@ -36,9 +36,9 @@ POSTMARK_TOKEN = os.environ.get("POSTMARK_TOKEN")
 APP_BASE_URL   = os.environ.get("APP_BASE_URL", "https://clip-rename-trial.onrender.com")
 FROM_EMAIL     = os.environ.get("FROM_EMAIL", "no-reply@example.com")  # must be a verified sender in Postmark
 
-WHISPER_MODEL  = os.environ.get("WHISPER_MODEL", "tiny")   # tiny/base for CPU
-WHISPER_MAX_SEC= int(os.environ.get("WHISPER_MAX_SEC", "120"))  # cap transcript to 2 min audio
-CPU_THREADS    = int(os.environ.get("CPU_THREADS", "4"))
+WHISPER_MODEL   = os.environ.get("WHISPER_MODEL", "tiny")   # tiny/base for CPU
+WHISPER_MAX_SEC = int(os.environ.get("WHISPER_MAX_SEC", "120"))  # cap transcript
+CPU_THREADS     = int(os.environ.get("CPU_THREADS", "4"))
 
 s3 = boto3.client("s3", region_name=AWS_REGION)
 signer = URLSafeTimedSerializer(SECRET_KEY)
@@ -76,6 +76,16 @@ def _ffprobe_json(path: str) -> dict:
         return json.loads(j)
     except Exception:
         return {}
+
+def _has_audio_stream(ffprobe_info: dict) -> bool:
+    streams = ffprobe_info.get("streams") or []
+    for s in streams:
+        if s.get("codec_type") == "audio":
+            ch = int(str(s.get("channels", "0")) or "0")
+            sr = int(str(s.get("sample_rate", "0")) or "0")
+            if ch > 0 and sr > 0:
+                return True
+    return False
 
 def _sha1_short(path: str, bytes_limit: int = 8_000_000) -> str:
     """Fast file ID: SHA1 of the first N bytes."""
@@ -167,7 +177,6 @@ def _extract_audio(src_video: str, out_wav: str, max_seconds: int = 120):
 
 def _transcribe(audio_path: str) -> str:
     model = _load_whisper()
-    # lightweight decode settings for CPU
     segments, info = model.transcribe(
         audio_path,
         language="en",
@@ -183,7 +192,7 @@ def _transcribe(audio_path: str) -> str:
         if seg.no_speech_prob and seg.no_speech_prob > 0.6:
             continue
         out.append(seg.text.strip())
-        if sum(len(x) for x in out) > 4000:  # cap text length
+        if sum(len(x) for x in out) > 4000:
             break
     return " ".join(out).strip()
 
@@ -195,8 +204,8 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
     """
     Returns (scene, subject, action) from transcript text.
     - subject: most common PERSON entity; fallback to top Proper Noun/Noun chunk
-    - action: most common verb lemma (non-aux), short
-    - scene: look for 'at|in|on|near the|a ...' noun phrase; else LOC/GPE entity; else top noun chunk
+    - action: most common verb lemma (non-aux)
+    - scene: 'at/in/on/near ...' phrase; else LOC/GPE entity; else top noun chunk
     """
     if not text or len(text) < 5:
         return ("scene", "subject", "action")
@@ -204,38 +213,29 @@ def _labels_from_transcript(text: str) -> Tuple[str, str, str]:
     nlp = _load_nlp()
     doc = nlp(text)
 
-    # SUBJECT (PERSON)
     persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
     subject = _most_common(persons)
     if not subject:
-        # fallback: proper nouns
         proper = [t.text for t in doc if t.pos_ == "PROPN" and len(t.text) > 1]
         subject = _most_common(proper)
     if not subject:
-        # fallback: noun chunks
         noun_chunks = [nc.root.text for nc in doc.noun_chunks]
         subject = _most_common(noun_chunks) or "subject"
 
-    # ACTION (VERB)
     verbs = [t.lemma_ for t in doc if t.pos_ == "VERB" and t.lemma_ not in {"be","do","have"}]
     action = _most_common(verbs) or "action"
 
-    # SCENE (prepositional phrase → places)
     scene = ""
-    # simple regex for " at/in/on/near ... "
     m = re.search(r"\b(at|in|on|near|inside|outside)\s+(the\s+|a\s+|an\s+)?([A-Za-z0-9\- ]{3,40})", text, flags=re.IGNORECASE)
     if m:
         scene = m.group(3).strip()
     if not scene:
-        # Location entities first
         locs = [ent.text for ent in doc.ents if ent.label_ in {"GPE","LOC","FAC"}]
         scene = _most_common(locs)
     if not scene:
-        # fallback: frequent noun chunk
         noun_phrases = [" ".join([t.text for t in nc]) for nc in doc.noun_chunks]
         scene = _most_common(noun_phrases) or "scene"
 
-    # clean up
     def clean(s: str) -> str:
         s = re.sub(r"\s+", " ", s)
         return s.strip()
@@ -254,7 +254,6 @@ async def start_job(req: Request):
     Client sends: { filename: 'clip.mp4', content_type: 'video/mp4' } (optional)
     Returns: { job_id, upload_url (S3 presigned PUT), object_key }
     """
-    # Be tolerant of empty/non-JSON bodies
     try:
         body = await req.json()
         if not isinstance(body, dict):
@@ -278,7 +277,7 @@ async def start_job(req: Request):
         upload_url = s3.generate_presigned_url(
             ClientMethod="put_object",
             Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": content_type},
-            ExpiresIn=3600,  # 1 hour
+            ExpiresIn=3600,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Presign error: {e}")
@@ -335,18 +334,24 @@ def _process_real(job_id: str, orig_name: str):
 
         # ---------- AI: transcript → labels ----------
         audio_wav = os.path.join(tmpdir, "snippet.wav")
-        max_sec = min(WHISPER_MAX_SEC, int(max(15, duration)))  # transcribe up to 2 min or clip length
-        step("Transcribing audio…", 28)
-        try:
-            _extract_audio(local_in, audio_wav, max_seconds=max_sec)
-            transcript = _transcribe(audio_wav)
-        except Exception:
+        max_sec = min(WHISPER_MAX_SEC, int(max(15, duration)))
+
+        has_audio = _has_audio_stream(info)
+        if has_audio:
+            step("Transcribing audio…", 28)
+            try:
+                _extract_audio(local_in, audio_wav, max_seconds=max_sec)
+                transcript = _transcribe(audio_wav)
+            except Exception:
+                transcript = ""
+        else:
+            step("No audio detected — skipping transcription", 28)
             transcript = ""
 
         step("Finding subject, action, scene…", 40)
         scene_ai, subject_ai, action_ai = _labels_from_transcript(transcript)
 
-        # VERY small guardrails: if transcript was empty, fall back to filename tokens
+        # Fallbacks from original filename tokens
         base, ext = os.path.splitext(in_name)
         ext = ext.lstrip(".").lower() or "mp4"
         tokens = [t for t in re_split(r"[-_ .]+", base) if t]
@@ -408,7 +413,6 @@ async def finalize_upload(payload: Dict, background: BackgroundTasks):
     if not job_id or job_id not in JOBS:
         raise HTTPException(status_code=400, detail="Unknown job_id")
 
-    # Ensure the upload exists before processing
     try:
         s3.head_object(Bucket=S3_BUCKET, Key=JOBS[job_id]["object_key"])
     except Exception:
@@ -459,7 +463,6 @@ def download(job_id: str):
         except Exception:
             pass
 
-    # Fallback: in-memory ZIP (shouldn't be needed)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("README.txt", "Zip not found in S3; fallback path.\n")
@@ -503,11 +506,10 @@ def direct_download(token: str):
     if not job_id or job_id not in JOBS or not JOBS[job_id].get("ready"):
         raise HTTPException(status_code=404, detail="Job not found or not ready")
 
-    # Issue a short-lived S3 URL and redirect the browser directly
     result_key = JOBS[job_id]["result_key"]
     signed = s3.generate_presigned_url(
         ClientMethod="get_object",
         Params={"Bucket": S3_BUCKET, "Key": result_key},
-        ExpiresIn=600,  # 10 minutes
+        ExpiresIn=600,
     )
     return RedirectResponse(url=signed, status_code=302)
